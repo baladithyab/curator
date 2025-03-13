@@ -800,59 +800,289 @@ AWS Bedrock provides inference profiles that allow users to:
 1. **Cross-region (system-defined) inference profiles**: Predefined profiles that include multiple regions
 2. **Application inference profiles**: User-created profiles for tracking costs and usage, can route to one or multiple regions
 
-#### Creating and Using Inference Profiles
+#### System-Defined Cross-Region Inference Profiles
 
-**Creating a single-region application inference profile:**
-```python
-import boto3
-bedrock_client = boto3.client("bedrock", region_name="us-east-1")
-response = bedrock_client.create_inference_profile(
-    inferenceProfileName="my-inference-profile",
-    modelSource={
-        "copyFrom": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
-    },
-    description="My inference profile for Claude 3 Sonnet",
-    tags=[
-        {
-            "key": "project",
-            "value": "my-project"
-        }
-    ]
-)
-```
+AWS provides predefined inference profiles that route requests across multiple regions automatically. These profiles are immutable and have specific source and destination regions.
 
-**Using an inference profile with the Converse API:**
+**Key Terminology:**
+- **Source Region**: The region from which you make the API request specifying the inference profile
+- **Destination Region**: A region to which AWS Bedrock can route the request from your source region
+
+##### Available Cross-Region Inference Profiles
+
+| Inference Profile | Profile ID | Source Regions | Destination Regions |
+|-------------------|------------|----------------|---------------------|
+| US Nova Lite | `us.amazon.nova-lite-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Nova Micro | `us.amazon.nova-micro-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Nova Pro | `us.amazon.nova-pro-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Anthropic Claude 3 Haiku | `us.anthropic.claude-3-haiku-20240307-v1:0` | us-east-1, us-east-2, us-west-2 | Varies by source: <br>- From us-east-1: us-east-1, us-west-2<br>- From us-east-2: us-east-1, us-east-2, us-west-2<br>- From us-west-2: us-east-1, us-west-2 |
+| US Anthropic Claude 3 Opus | `us.anthropic.claude-3-opus-20240229-v1:0` | us-east-1, us-west-2 | us-east-1, us-west-2 |
+| US Anthropic Claude 3 Sonnet | `us.anthropic.claude-3-sonnet-20240229-v1:0` | us-east-1, us-west-2 | us-east-1, us-west-2 |
+| US Anthropic Claude 3.5 Sonnet | `us.anthropic.claude-3-5-sonnet-20240620-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Anthropic Claude 3.5 Haiku | `us.anthropic.claude-3-5-haiku-20241022-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Anthropic Claude 3.5 Sonnet v2 | `us.anthropic.claude-3-5-sonnet-20241022-v2:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Anthropic Claude 3.7 Sonnet | `us.anthropic.claude-3-7-sonnet-20250219-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.1 8B Instruct | `us.meta.llama3-1-8b-instruct-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.1 70B Instruct | `us.meta.llama3-1-70b-instruct-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.1 405B Instruct | `us.meta.llama3-1-405b-instruct-v1:0` | us-east-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.2 1B Instruct | `us.meta.llama3-2-1b-instruct-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.2 3B Instruct | `us.meta.llama3-2-3b-instruct-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.2 11B Instruct | `us.meta.llama3-2-11b-instruct-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.2 90B Instruct | `us.meta.llama3-2-90b-instruct-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+| US Meta Llama 3.3 70B Instruct | `us.meta.llama3-3-70b-instruct-v1:0` | us-east-1, us-east-2, us-west-2 | us-east-1, us-east-2, us-west-2 |
+
+**Important Notes About Cross-Region Inference Profiles:**
+- AWS will not add new regions to existing inference profiles; instead, new profiles may be created as regions are added
+- Routing behavior can differ based on the source region (see Claude 3 Haiku example above)
+- To check destination regions for a profile, you can use the `GetInferenceProfile` API with a control plane endpoint from your source region
+
+##### Using Cross-Region Inference Profiles
+
+To use a cross-region inference profile, simply specify the profile ID in your API call instead of a model ID:
+
 ```python
 import boto3
 bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-east-1")
 inference_profile_id = 'us.anthropic.claude-3-sonnet-20240229-v1:0'
 
-response = bedrock_runtime.converse(
+response = bedrock_runtime.invoke_model(
     modelId=inference_profile_id,
-    system=[{"text": "You are an expert on AWS AI services."}],
-    messages=[{
-        "role": "user",
-        "content": [{"text": "Tell me about AWS Bedrock"}]
-    }]
+    body=json.dumps({
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000
+    })
 )
 ```
 
-### API Reference
+#### Application Inference Profiles
 
-AWS Bedrock provides multiple APIs for online processing:
+Application inference profiles are user-created profiles that can track metrics, costs, and usage for model invocation. You can create application inference profiles that route to a single region or to multiple regions using a cross-region inference profile.
 
-1. **InvokeModel**: Synchronous single prompt-response (non-streaming)
-2. **InvokeModelWithResponseStream**: Streaming response for single prompt
-3. **Converse**: Conversation-based API with messages
-4. **ConverseStream**: Streaming version of the Converse API
+##### Creating an Application Inference Profile from a Foundation Model
 
-### Implementation Considerations
+```python
+import boto3
+import json
 
-1. **Rate Limiting**: AWS Bedrock enforces rate limits based on tokens per minute and requests per minute
-2. **Timeouts**: Model responses may timeout for complex queries
-3. **Error Handling**: Implement retries for throttling errors
-4. **Token Usage**: Monitor token usage for cost management
-5. **Model Selection**: Choose appropriate model based on capabilities and region availability
+# Initialize the Bedrock client
+bedrock = boto3.client('bedrock', region_name='us-west-2')
+
+# Create an application inference profile from a foundation model
+response = bedrock.create_inference_profile(
+    inferenceProfileName="MyClaudeSonnetProfile",
+    modelSource={
+        "copyFrom": "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+    },
+    description="Application inference profile for Claude 3 Sonnet",
+    tags=[
+        {
+            "key": "project",
+            "value": "customer-service-ai"
+        },
+        {
+            "key": "department", 
+            "value": "ai-research"
+        }
+    ]
+)
+
+print("Created inference profile with ARN:", response["inferenceProfileArn"])
+print("Status:", response["status"])
+```
+
+##### Creating an Application Inference Profile from a Cross-Region Inference Profile
+
+```python
+import boto3
+import json
+
+# Initialize the Bedrock client
+bedrock = boto3.client('bedrock', region_name='us-west-2')
+account_id = "123456789012"  # Replace with your AWS account ID
+
+# Create an application inference profile from a cross-region inference profile
+response = bedrock.create_inference_profile(
+    inferenceProfileName="MyCrossRegionClaudeSonnetProfile",
+    modelSource={
+        "copyFrom": f"arn:aws:bedrock:us-west-2:{account_id}:inference-profile/us.anthropic.claude-3-sonnet-20240229-v1:0"
+    },
+    description="Cross-region application inference profile for Claude 3 Sonnet",
+    tags=[
+        {
+            "key": "environment",
+            "value": "production"
+        }
+    ]
+)
+
+print("Created cross-region inference profile with ARN:", response["inferenceProfileArn"])
+print("Status:", response["status"])
+```
+
+##### Using an Application Inference Profile with InvokeModel
+
+```python
+import boto3
+import json
+
+# Initialize the Bedrock Runtime client
+bedrock_runtime = boto3.client('bedrock-runtime', region_name='us-west-2')
+account_id = "123456789012"  # Replace with your AWS account ID
+
+# Application inference profile ARN
+inference_profile_arn = f"arn:aws:bedrock:us-west-2:{account_id}:inference-profile/MyClaudeSonnetProfile"
+
+# Use the application inference profile for inference
+response = bedrock_runtime.invoke_model(
+    modelId=inference_profile_arn,
+    body=json.dumps({
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Explain quantum computing in simple terms."
+                    }
+                ]
+            }
+        ],
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000,
+        "temperature": 0.7
+    })
+)
+
+# Process the response
+response_body = json.loads(response['body'].read())
+print(response_body['content'][0]['text'])
+```
+
+##### Using an Application Inference Profile with the Converse API
+
+```python
+import boto3
+import json
+
+# Initialize the Bedrock Runtime client
+bedrock_runtime = boto3.client('bedrock-runtime', region_name='us-west-2')
+account_id = "123456789012"  # Replace with your AWS account ID
+
+# Application inference profile ARN
+inference_profile_arn = f"arn:aws:bedrock:us-west-2:{account_id}:inference-profile/MyClaudeSonnetProfile"
+
+# Use the application inference profile with the Converse API
+response = bedrock_runtime.converse(
+    modelId=inference_profile_arn,
+    system=[{"text": "You are an expert in cloud computing."}],
+    messages=[
+        {
+            "role": "user",
+            "content": [{"text": "What are the main services offered by AWS?"}]
+        }
+    ]
+)
+
+# Process the response
+print(response['output']['message']['content'][0]['text'])
+```
+
+##### Viewing Information About an Inference Profile
+
+```python
+import boto3
+
+# Initialize the Bedrock client
+bedrock = boto3.client('bedrock', region_name='us-west-2')
+account_id = "123456789012"  # Replace with your AWS account ID
+
+# Get information about the application inference profile
+response = bedrock.get_inference_profile(
+    inferenceProfileIdentifier=f"arn:aws:bedrock:us-west-2:{account_id}:inference-profile/MyClaudeSonnetProfile"
+)
+
+print("Inference Profile Name:", response.get("inferenceProfileName"))
+print("Description:", response.get("description"))
+print("Status:", response.get("status"))
+print("Model Source:", response.get("modelSource"))
+print("Creation Time:", response.get("creationTime"))
+print("Last Modified Time:", response.get("lastModifiedTime"))
+```
+
+##### Listing Inference Profiles
+
+```python
+import boto3
+
+# Initialize the Bedrock client
+bedrock = boto3.client('bedrock', region_name='us-west-2')
+
+# List all application inference profiles
+response = bedrock.list_inference_profiles()
+
+for profile in response.get("inferenceProfiles", []):
+    print("Name:", profile.get("inferenceProfileName"))
+    print("ARN:", profile.get("inferenceProfileArn"))
+    print("Status:", profile.get("status"))
+    print("Created:", profile.get("creationTime"))
+    print("-" * 50)
+```
+
+##### Deleting an Application Inference Profile
+
+```python
+import boto3
+
+# Initialize the Bedrock client
+bedrock = boto3.client('bedrock', region_name='us-west-2')
+account_id = "123456789012"  # Replace with your AWS account ID
+
+# Delete the application inference profile
+response = bedrock.delete_inference_profile(
+    inferenceProfileIdentifier=f"arn:aws:bedrock:us-west-2:{account_id}:inference-profile/MyClaudeSonnetProfile"
+)
+
+print("Deletion status:", response.get("status"))
+```
+
+#### Using AWS CLI for Inference Profiles
+
+You can also manage inference profiles using the AWS CLI:
+
+##### Creating an Application Inference Profile with AWS CLI
+
+```bash
+# Create an application inference profile from a foundation model
+aws bedrock create-inference-profile \
+    --inference-profile-name MyClaudeSonnetProfile \
+    --model-source '{"copyFrom": "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"}' \
+    --description "Application inference profile for Claude 3 Sonnet" \
+    --tags '[{"key":"project","value":"customer-service-ai"}]' \
+    --region us-west-2
+
+# Create an application inference profile from a cross-region inference profile
+aws bedrock create-inference-profile \
+    --inference-profile-name MyCrossRegionClaudeSonnetProfile \
+    --model-source '{"copyFrom": "arn:aws:bedrock:us-west-2:123456789012:inference-profile/us.anthropic.claude-3-sonnet-20240229-v1:0"}' \
+    --description "Cross-region application inference profile for Claude 3 Sonnet" \
+    --tags '[{"key":"environment","value":"production"}]' \
+    --region us-west-2
+```
+
+#### Key Benefits of Using Inference Profiles
+
+1. **Improved Throughput**: Cross-region inference profiles can route requests to multiple regions, increasing your overall throughput and reducing latency.
+
+2. **Cost Tracking**: Application inference profiles allow you to attach tags for cost allocation, making it easier to track and analyze your spending on different AI projects.
+
+3. **Usage Metrics**: Get detailed CloudWatch metrics for your model invocations when using application inference profiles.
+
+4. **Resilience**: Cross-region inference profiles improve resilience by allowing requests to be routed to healthy regions if one region experiences issues.
+
+5. **Simplified Resource Management**: Create a single resource (inference profile) that can be referenced across your applications instead of managing region-specific model endpoints.
+
+6. **Higher Rate Limits**: Using cross-region inference profiles can help you achieve higher rate limits by leveraging quotas across multiple regions.
 
 ## Batch Inference
 
@@ -869,33 +1099,79 @@ Not all models support batch inference. Below is a detailed breakdown of models 
 - **Provisioned models**: Batch inference is not supported for provisioned models
 - **Core regions**: The primary regions supporting batch inference are us-east-1, us-west-2, ap-northeast-1, ap-southeast-1, and eu-central-1
 
+#### Models Supporting Application Inference Profiles
+
+The following foundation models support application inference profiles, which can be used with both online and batch processing where available:
+
+* Amazon Titan Embeddings G1 - Text
+* Amazon Titan Image Generator G1 v2
+* Amazon Titan Image Generator G1
+* Amazon Titan Text Embeddings V2
+* Anthropic Claude 2.1
+* Anthropic Claude 3 Haiku
+* Anthropic Claude 3 Opus
+* Anthropic Claude 3 Sonnet
+* Anthropic Claude 3.5 Sonnet
+* Anthropic Claude 3.5 Haiku
+* Anthropic Claude 3.7 Sonnet
+* Meta Llama 3 70B Instruct
+* Meta Llama 3 8B Instruct
+* Meta Llama 3.2 11B Instruct
+* Meta Llama 3.2 1B Instruct
+* Meta Llama 3.2 3B Instruct
+* Meta Llama 3.2 90B Instruct
+* Mistral AI Mistral 7B Instruct
+* Mistral AI Mixtral 8x7B Instruct
+* Stability AI SDXL 1.0
+
+#### Complete List of Models Supporting Batch Inference
+
+The following table shows the complete and most up-to-date list of models that support batch inference and their specific regional availability:
+
+| Provider   | Model                          | Regions Supporting Batch Inference                                                                                                                          |
+| ---------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Amazon     | Nova Lite                      | us-east-1                                                                                                                                                    |
+| Amazon     | Nova Micro                     | us-east-1                                                                                                                                                    |
+| Amazon     | Nova Pro                       | us-east-1                                                                                                                                                    |
+| Amazon     | Titan Text G1 - Express        | us-east-1, us-west-2, ap-northeast-1, ap-southeast-1, eu-central-1                                                                                           |
+| Amazon     | Titan Text G1 - Lite           | us-east-1, us-west-2, ap-northeast-1, ap-southeast-1, eu-central-1                                                                                           |
+| Amazon     | Titan Text G1 - Premier        | us-east-1, us-west-2, ap-northeast-1, ap-southeast-1, eu-central-1                                                                                           |
+| Amazon     | Titan Multimodal Embeddings G1 | us-east-1, us-west-2, ap-northeast-2, ap-south-1, ap-southeast-2, ca-central-1, eu-central-1, eu-west-1, eu-west-2, eu-west-3, sa-east-1                     |
+| Amazon     | Titan Text Embeddings V2       | us-east-1, us-west-2, ap-northeast-2, ca-central-1, eu-central-1, eu-west-2, sa-east-1                                                                       |
+| Anthropic  | Claude 3.5 Haiku               | us-west-2                                                                                                                                                    |
+| Anthropic  | Claude 3.5 Sonnet              | us-east-1, us-west-2, ap-northeast-1, ap-northeast-2, ap-southeast-1, eu-central-1                                                                           |
+| Anthropic  | Claude 3.5 Sonnet v2           | us-west-2                                                                                                                                                    |
+| Anthropic  | Claude 3.7 Sonnet              | us-east-1, us-east-2, us-west-2                                                                                                                              |
+| Anthropic  | Claude 3 Haiku                 | us-east-1, us-west-2, ap-northeast-1, ap-northeast-2, ap-south-1, ap-southeast-1, ap-southeast-2, ca-central-1, eu-central-1, eu-west-1, eu-west-2, eu-west-3, sa-east-1 |
+| Anthropic  | Claude 3 Opus                  | us-west-2                                                                                                                                                    |
+| Anthropic  | Claude 3 Sonnet                | us-east-1, us-west-2, ap-south-1, ap-southeast-2, ca-central-1, eu-central-1, eu-west-1, eu-west-2, eu-west-3, sa-east-1                                      |
+| Anthropic  | Claude 2.1                     | us-east-1, us-west-2, ap-northeast-1, eu-central-1                                                                                                           |
+| Anthropic  | Claude 2.0                     | us-east-1, us-west-2, ap-southeast-1, eu-central-1                                                                                                           |
+| Meta       | Llama 3.1 8B Instruct          | us-east-1, us-west-2                                                                                                                                         |
+| Meta       | Llama 3.1 70B Instruct         | us-west-2                                                                                                                                                    |
+| Meta       | Llama 3.1 405B Instruct        | us-west-2                                                                                                                                                    |
+| Meta       | Llama 3.2 1B Instruct          | us-east-1, us-west-2                                                                                                                                         |
+| Meta       | Llama 3.2 3B Instruct          | us-east-1, us-west-2                                                                                                                                         |
+| Meta       | Llama 3.2 11B Instruct         | us-east-1, us-west-2                                                                                                                                         |
+| Meta       | Llama 3.2 90B Instruct         | us-east-1, us-west-2                                                                                                                                         |
+| Meta       | Llama 3.3 70B Instruct         | us-east-1, us-west-2                                                                                                                                         |
+| AI21 Labs  | Jurassic-2 Mid                 | us-east-1                                                                                                                                                    |
+| AI21 Labs  | Jurassic-2 Ultra               | us-east-1                                                                                                                                                    |
+| AI21 Labs  | J2 Jumbo Instruct              | us-east-1                                                                                                                                                    |
+| AI21 Labs  | Jamba-Instruct                 | us-east-1                                                                                                                                                    |
+| AI21 Labs  | Jamba 1.5 Large                | us-east-1                                                                                                                                                    |
+| AI21 Labs  | Jamba 1.5 Mini                 | us-east-1                                                                                                                                                    |
+| Mistral AI | Mistral Small (24.02)          | us-east-1                                                                                                                                                    |
+| Mistral AI | Mistral Large (24.02)          | us-east-1, us-west-2                                                                                                                                         |
+| Mistral AI | Mistral Large (24.07)          | us-west-2                                                                                                                                                    |
+| Mistral AI | Mixtral 8x7B Instruct          | us-east-1, us-west-2, ap-south-1, ap-southeast-2, ca-central-1, eu-west-1, eu-west-2, eu-west-3, sa-east-1                                                   |
+| Cohere     | Command                        | us-east-1, us-west-2                                                                                                                                         |
+| Cohere     | Command R                      | us-east-1, us-west-2                                                                                                                                         |
+| Cohere     | Command R+                     | us-east-1, us-west-2                                                                                                                                         |
+| Cohere     | Embed English                  | us-east-1, us-west-2                                                                                                                                         |
+| Cohere     | Embed Multilingual             | us-east-1, us-west-2                                                                                                                                         |
+
 #### Detailed Batch Inference Model Availability
-
-**Amazon Models**:
-- Amazon Titan Text models (Express, Lite, Premier): us-east-1, us-west-2, ap-northeast-1, ap-southeast-1, eu-central-1
-- Amazon Titan Embeddings models: Available in selected regions similar to their online processing availability
-- Amazon Nova models: us-east-1 only
-
-**Anthropic Claude Models**:
-- Claude 3 Opus: us-west-2 only
-- Claude 3 Sonnet: us-east-1, us-west-2, ap-south-1, ap-southeast-2, ca-central-1, eu-central-1, eu-west-1, eu-west-2, eu-west-3, sa-east-1
-- Claude 3 Haiku: Available in all regions where online processing is supported
-- Claude 3.5 Sonnet: us-east-1, us-west-2, ap-northeast-1, ap-northeast-2, ap-southeast-1, eu-central-1
-- Claude 3.5 Sonnet v2: us-west-2 only
-- Claude 3.5 Haiku: us-west-2 only
-- Claude 3.7 Sonnet: us-east-1, us-east-2, us-west-2
-
-**AI21 Labs Models**:
-- Jurassic-2 Models: us-east-1 only
-- Jamba Models: us-east-1, us-west-2
-
-**Meta Llama Models**:
-- Llama 3.1 405B Instruct: us-west-2 only
-- Llama 3.1 70B Instruct: us-west-2
-- Other Llama models: Primarily available in us-east-1, us-west-2
-
-**Mistral AI and Cohere Models**:
-- Primarily available in us-east-1, us-west-2, with some availability in other regions
 
 ### Input/Output Formats
 
@@ -953,46 +1229,212 @@ response = bedrock_client.create_model_invocation_job(
 job_arn = response['jobArn']
 ```
 
-#### Monitoring Batch Jobs
+#### Comprehensive Batch Inference Job Management
+
+Here are detailed examples for managing batch inference jobs throughout their lifecycle:
+
+##### Creating a Batch Job with Advanced Options
 
 ```python
+import boto3
+import json
+
+# Initialize the Bedrock client
+bedrock_client = boto3.client('bedrock', region_name='us-west-2')
+
+# Create a batch inference job with advanced options
+response = bedrock_client.create_model_invocation_job(
+    # Required parameters
+    jobName="example-batch-job",
+    modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+    roleArn="arn:aws:iam::123456789012:role/BedrockBatchJobRole",
+    inputDataConfig={
+        "s3InputDataConfig": {
+            "s3Uri": "s3://my-input-bucket/batch-data/",
+            # Optional - specify KMS key for input encryption
+            "kmsKeyId": "arn:aws:kms:us-west-2:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+        }
+    },
+    outputDataConfig={
+        "s3OutputDataConfig": {
+            "s3Uri": "s3://my-output-bucket/batch-results/",
+            # Optional - specify KMS key for output encryption
+            "kmsKeyId": "arn:aws:kms:us-west-2:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+        }
+    },
+    
+    # Optional parameters
+    # Timeout in hours (default is 24 hours)
+    timeoutDurationInHours=12,
+    
+    # VPC configuration for enhanced security
+    vpcConfig={
+        "subnetIds": [
+            "subnet-0abc123def456789a",
+            "subnet-0def456789abc123d"
+        ],
+        "securityGroupIds": [
+            "sg-0123456789abcdef0"
+        ]
+    },
+    
+    # Tags for resource organization and cost tracking
+    tags=[
+        {
+            "key": "Department",
+            "value": "AI-Research"
+        },
+        {
+            "key": "Project",
+            "value": "TextSummarization"
+        },
+        {
+            "key": "Environment",
+            "value": "Production"
+        }
+    ],
+    
+    # Ensuring idempotency
+    clientRequestToken="unique-token-123456789"
+)
+
+print(f"Batch job created successfully. Job ARN: {response['jobArn']}")
+print(f"Job status: {response['status']}")
+```
+
+##### Get Batch Inference Job Status
+
+```python
+import boto3
+
+# Initialize the Bedrock client
+bedrock_client = boto3.client('bedrock', region_name='us-west-2')
+
+# Get details about a specific batch inference job
 response = bedrock_client.get_model_invocation_job(
-    jobIdentifier=job_arn
+    jobIdentifier="arn:aws:bedrock:us-west-2:123456789012:model-invocation-job/example-batch-job"
 )
 
-status = response['status']
-print(f"Job status: {status}")
-
-# Status will be one of: IN_PROGRESS, COMPLETED, FAILED, STOPPING, STOPPED
+# Print job details
+print(f"Job Name: {response['jobName']}")
+print(f"Model ID: {response['modelId']}")
+print(f"Status: {response['status']}")
 ```
 
-#### Stopping a Batch Job
+##### List All Batch Inference Jobs
 
 ```python
-response = bedrock_client.stop_model_invocation_job(
-    jobIdentifier=job_arn
+import boto3
+
+# Initialize the Bedrock client
+bedrock_client = boto3.client('bedrock', region_name='us-west-2')
+
+# List all batch inference jobs with optional filters
+response = bedrock_client.list_model_invocation_jobs(
+    # Optional filters
+    # maxResults=10,
+    # nextToken="string",
+    # filters=[
+    #     {
+    #         "name": "ModelId",
+    #         "operator": "Equals",
+    #         "values": ["anthropic.claude-3-haiku-20240307-v1:0"]
+    #     },
+    #     {
+    #         "name": "Status",
+    #         "operator": "Equals",
+    #         "values": ["Completed"]
+    #     }
+    # ]
 )
+
+# Print information about each job
+for job in response['modelInvocationJobs']:
+    print(f"Job Name: {job['jobName']}")
+    print(f"Job ARN: {job['jobArn']}")
+    print(f"Model ID: {job['modelId']}")
+    print(f"Status: {job['status']}")
+    print(f"Creation Time: {job['creationTime']}")
+    if 'endTime' in job:
+        print(f"End Time: {job['endTime']}")
+    print("-" * 50)
+
+# Handle pagination
+if 'nextToken' in response:
+    print("More results available. Use nextToken for pagination.")
 ```
 
-### Implementation Considerations
+##### Stop a Batch Inference Job
 
-1. **Quota Limits**: Batch inference has specific quotas to consider:
-   - Minimum records per job
-   - Maximum records per input file
-   - Maximum records per job
-   - Maximum input file size
-   - Maximum cumulative job size
+```python
+import boto3
 
-2. **IAM Permissions**: The IAM role requires permissions for:
-   - S3 read access to input bucket
-   - S3 write access to output bucket
-   - Bedrock model invocation permissions
+# Initialize the Bedrock client
+bedrock_client = boto3.client('bedrock', region_name='us-west-2')
 
-3. **VPC Configuration**: Batch jobs can be configured to run within a VPC for enhanced security
+# Stop a running batch inference job
+response = bedrock_client.stop_model_invocation_job(
+    jobIdentifier="arn:aws:bedrock:us-west-2:123456789012:model-invocation-job/example-batch-job"
+)
 
-4. **Timeouts**: Batch jobs have a configurable timeout (in hours)
+print(f"Job stopping initiated. Current status: {response['status']}")
+```
 
-5. **Cost Management**: Monitor batch job costs, as they accumulate based on the number of tokens processed
+##### Using AWS CLI for Batch Inference Jobs
+
+```bash
+# Create a batch inference job
+aws bedrock create-model-invocation-job \
+    --job-name example-batch-job \
+    --model-id anthropic.claude-3-sonnet-20240229-v1:0 \
+    --role-arn arn:aws:iam::123456789012:role/BedrockBatchJobRole \
+    --input-data-config '{"s3InputDataConfig":{"s3Uri":"s3://my-input-bucket/batch-data/"}}' \
+    --output-data-config '{"s3OutputDataConfig":{"s3Uri":"s3://my-output-bucket/batch-results/"}}' \
+    --region us-west-2
+
+# Get status of a batch inference job
+aws bedrock get-model-invocation-job \
+    --job-identifier arn:aws:bedrock:us-west-2:123456789012:model-invocation-job/example-batch-job \
+    --region us-west-2
+
+# List all batch inference jobs
+aws bedrock list-model-invocation-jobs \
+    --region us-west-2
+
+# Stop a batch inference job
+aws bedrock stop-model-invocation-job \
+    --job-identifier arn:aws:bedrock:us-west-2:123456789012:model-invocation-job/example-batch-job \
+    --region us-west-2
+```
+
+#### Batch Inference Job Status Monitoring
+
+Batch inference jobs can have the following status values:
+
+| Status | Description |
+|--------|-------------|
+| `Submitted` | Job has been submitted but processing hasn't started yet |
+| `InProgress` | Job is currently being processed |
+| `Completed` | Job has completed successfully |
+| `Failed` | Job has failed due to an error |
+| `Stopping` | Job is in the process of stopping |
+| `Stopped` | Job has been stopped by the user |
+| `Expired` | Job has reached its timeout duration |
+
+#### Best Practices for Batch Inference Jobs
+
+1. **Use appropriate timeouts**: Set `timeoutDurationInHours` based on your expected job duration.
+2. **Monitor job status**: Regularly poll job status to check for completion or failures.
+3. **Implement error handling**: Check for failure messages in job responses and implement appropriate retry logic.
+4. **Structure your input data efficiently**: Group similar requests together for better processing efficiency.
+5. **Consider VPC configuration**: For sensitive data, use VPC configurations to enhance security.
+6. **Add tags for cost allocation**: Use tags to track costs across different projects or departments.
+7. **Limit concurrent jobs**: Be aware of the quota limit of 10 batch inference jobs per model per region.
+8. **Take advantage of pricing benefits**: Batch inference is offered at 50% of the On-Demand inference price.
+
+### Input/Output Formats
+
+// ... existing code ...
 
 ## Cross-Region Considerations
 
