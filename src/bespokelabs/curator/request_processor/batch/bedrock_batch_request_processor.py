@@ -53,9 +53,11 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         "anthropic.claude-3-7-sonnet-20250219-v1:0",
         
         # Amazon models
-        "amazon.titan-text-express-v1",
-        "amazon.titan-text-lite-v1",
-        "amazon.titan-embed-text-v1",
+        "amazon.titan-multimodal-embeddings-g1-v1",
+        "amazon.titan-text-embeddings-v2",
+        "amazon.nova-lite-v1:0",
+        "amazon.nova-micro-v1:0",
+        "amazon.nova-pro-v1:0",
         
         # Meta Llama models
         "meta.llama3-1-8b-instruct-v1:0",
@@ -68,20 +70,13 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         "meta.llama3-3-70b-instruct-v1:0",
         
         # Mistral AI models
-        "mistral.mistral-large-2402-v1:0",  # Mistral Small (24.02)
+        "mistral.mistral-small-2402-v1:0",  # Mistral Small (24.02)
         "mistral.mistral-large-2407-v1:0",  # Mistral Large (24.07)
-        
-        # Note: The following Mistral models may work but aren't explicitly listed
-        # in AWS documentation as supporting batch inference
-        "mistral.mistral-7b-instruct-v0:2",
-        "mistral.mixtral-8x7b-instruct-v0:1",
     ]
 
     # List of cross-region inference profiles
     INFERENCE_PROFILES = [
-        "us.amazon.nova-lite-v1:0",
-        "us.amazon.nova-micro-v1:0",
-        "us.amazon.nova-pro-v1:0",
+        # Anthropic Claude models
         "us.anthropic.claude-3-haiku-20240307-v1:0",
         "us.anthropic.claude-3-opus-20240229-v1:0",
         "us.anthropic.claude-3-sonnet-20240229-v1:0",
@@ -89,6 +84,15 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         "us.anthropic.claude-3-5-haiku-20241022-v1:0",
         "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
         "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        # Amazon models
+        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-micro-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.amazon.titan-text-express-v1:0",
+        "us.amazon.titan-text-premier-v1:0",
+        "us.amazon.titan-multimodal-embedding-g1-v1:0",
+        "us.amazon.titan-text-embedding-v2:0",
+        # Meta Llama models
         "us.meta.llama3-1-8b-instruct-v1:0",
         "us.meta.llama3-1-70b-instruct-v1:0",
         "us.meta.llama3-1-405b-instruct-v1:0",
@@ -97,6 +101,9 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         "us.meta.llama3-2-11b-instruct-v1:0",
         "us.meta.llama3-2-90b-instruct-v1:0",
         "us.meta.llama3-3-70b-instruct-v1:0",
+        # Mistral AI models
+        "us.mistral.mistral-small-2402-v1:0",
+        "us.mistral.mistral-large-2407-v1:0"
     ]
 
     def __init__(

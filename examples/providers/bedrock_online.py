@@ -98,6 +98,32 @@ def run_auto_inference_profile_example():
     response = processor.generate("Explain the concept of geo-distributed inference and its benefits.")
     print(f"Response with auto-converted inference profile:\n{response}")
 
+# Run with Converse API
+def run_converse_api_example():
+    """Run an example using the AWS Bedrock Converse API."""
+    print("\n=== Running with Converse API ===")
+    
+    # Use Claude with the Converse API
+    processor = curator.get_request_processor(
+        model_name="anthropic.claude-3-sonnet-20240229-v1:0",
+        backend="bedrock",
+        generation_params={"temperature": 0.7, "max_tokens": 500},
+        use_converse_api=True  # This enables the Converse API
+    )
+    
+    # Simple message
+    response = processor.generate("What are the benefits of using the Converse API in AWS Bedrock?")
+    print(f"Response with Converse API (simple message):\n{response}")
+    
+    # Using a more structured conversation with a system message
+    conversation = [
+        {"role": "system", "content": "You are a helpful AI assistant that specializes in explaining AWS services."},
+        {"role": "user", "content": "Can you explain the difference between the invoke_model and converse APIs in AWS Bedrock?"}
+    ]
+    
+    response = processor.generate(conversation)
+    print(f"\nResponse with Converse API (structured conversation):\n{response}")
+
 # Main function to run all examples
 def main():
     print("AWS Bedrock Online Inference Examples")
@@ -120,6 +146,12 @@ def main():
         
         run_inference_profile_example()
         run_auto_inference_profile_example()
+        
+        # Run the Converse API example
+        print("\n=== Converse API Example ===")
+        print("Note: Converse API is available for selected models in AWS Bedrock.")
+        
+        run_converse_api_example()
         
     except Exception as e:
         print(f"Error running examples: {str(e)}")

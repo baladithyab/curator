@@ -40,13 +40,12 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         config: Configuration for the request processor
         region_name: AWS region to use for Bedrock API calls
         use_inference_profile: Whether to use inference profiles instead of direct model IDs
+        use_converse_api: Whether to use the Converse API when available
     """
 
     # List of cross-region inference profiles
     INFERENCE_PROFILES = [
-        "us.amazon.nova-lite-v1:0",
-        "us.amazon.nova-micro-v1:0",
-        "us.amazon.nova-pro-v1:0",
+        # Anthropic Claude models
         "us.anthropic.claude-3-haiku-20240307-v1:0",
         "us.anthropic.claude-3-opus-20240229-v1:0",
         "us.anthropic.claude-3-sonnet-20240229-v1:0",
@@ -54,6 +53,15 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         "us.anthropic.claude-3-5-haiku-20241022-v1:0",
         "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
         "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        # Amazon models
+        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-micro-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.amazon.titan-text-express-v1:0",
+        "us.amazon.titan-text-premier-v1:0",
+        "us.amazon.titan-multimodal-embedding-g1-v1:0",
+        "us.amazon.titan-text-embedding-v2:0",
+        # Meta Llama models
         "us.meta.llama3-1-8b-instruct-v1:0",
         "us.meta.llama3-1-70b-instruct-v1:0",
         "us.meta.llama3-1-405b-instruct-v1:0",
@@ -62,6 +70,39 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         "us.meta.llama3-2-11b-instruct-v1:0",
         "us.meta.llama3-2-90b-instruct-v1:0",
         "us.meta.llama3-3-70b-instruct-v1:0",
+        # Mistral AI models
+        "us.mistral.mistral-small-2402-v1:0",
+        "us.mistral.mistral-large-2407-v1:0"
+    ]
+
+    # List of models that support the Converse API
+    CONVERSE_SUPPORTED_MODELS = [
+        # Anthropic Claude models
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "anthropic.claude-3-opus-20240229-v1:0",
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        # Meta Llama models
+        "meta.llama3-1-8b-instruct-v1:0",
+        "meta.llama3-1-70b-instruct-v1:0",
+        "meta.llama3-1-405b-instruct-v1:0",
+        "meta.llama3-2-1b-instruct-v1:0",
+        "meta.llama3-2-3b-instruct-v1:0",
+        "meta.llama3-2-11b-instruct-v1:0",
+        "meta.llama3-2-90b-instruct-v1:0",
+        "meta.llama3-3-70b-instruct-v1:0",
+        # Mistral AI models
+        "mistral.mistral-small-2402-v1:0",
+        "mistral.mistral-large-2407-v1:0",
+        # Amazon models
+        "amazon.titan-text-express-v1",
+        "amazon.titan-text-premier-v1",
+        "amazon.nova-lite-v1:0",
+        "amazon.nova-micro-v1:0",
+        "amazon.nova-pro-v1:0"
     ]
 
     def __init__(
@@ -69,18 +110,20 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         config: OnlineRequestProcessorConfig,
         region_name: str = None,
         use_inference_profile: bool = False,
+        use_converse_api: bool = False,
     ):
         """Initialize the BedrockOnlineRequestProcessor."""
         super().__init__(config)
         
         # Initialize AWS Bedrock client
         self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
-        self.client = boto3.client('bedrock-runtime', region_name=self.region_name)
+        self.bedrock_runtime = boto3.client('bedrock-runtime', region_name=self.region_name)
         self.bedrock = boto3.client('bedrock', region_name=self.region_name)
         
         # Store model ID and determine provider
         self.model_id = config.model
         self.use_inference_profile = use_inference_profile
+        self.use_converse_api = use_converse_api or os.environ.get("BEDROCK_USE_CONVERSE_API", "").lower() == "true"
         
         # If using inference profiles, check if the model ID is already a profile or needs conversion
         if self.use_inference_profile:
@@ -95,6 +138,8 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                    f"({self.model_provider}) in region {self.region_name}")
         if self.use_inference_profile:
             logger.info(f"Using inference profile: {self.model_id}")
+        if self.use_converse_api:
+            logger.info(f"Using Converse API when available")
         
         # Set up default prompt formatters based on model provider
         self.prompt_formatters = {
@@ -195,6 +240,8 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             return 5.0  # Amazon Titan models
         elif self.model_provider == "meta":
             return 5.0  # Meta Llama models
+        elif self.model_provider == "mistral":
+            return 5.0  # Mistral models
         else:
             return 4.0  # Default conservative limit for other providers
             
@@ -596,6 +643,122 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             
         return request_body
 
+    def _format_converse_request(self, generic_request: GenericRequest) -> dict:
+        """Format a request for the AWS Bedrock Converse API.
+        
+        Args:
+            generic_request: The generic request to format
+            
+        Returns:
+            Dict containing the formatted request for the Converse API
+        """
+        # Handle system message if provided
+        system_message = None
+        messages = []
+        
+        # Extract messages from the prompt
+        if isinstance(generic_request.prompt, list):
+            for message in generic_request.prompt:
+                if isinstance(message, dict):
+                    role = message.get("role", "user").lower()
+                    content = message.get("content", "")
+                    
+                    # Extract system message if present
+                    if role == "system":
+                        system_message = content
+                        continue
+                        
+                    # Format the message
+                    messages.append({
+                        "role": role,
+                        "content": content if isinstance(content, list) else [{"text": content}]
+                    })
+                else:
+                    # Default to user message for strings
+                    messages.append({
+                        "role": "user",
+                        "content": [{"text": str(message)}]
+                    })
+        else:
+            # Single string prompt becomes a user message
+            messages.append({
+                "role": "user",
+                "content": [{"text": str(generic_request.prompt)}]
+            })
+            
+        # Create the request body
+        request_body = {
+            "messages": messages
+        }
+        
+        # Add system message if present
+        if system_message:
+            request_body["system"] = system_message
+            
+        # Add inference parameters
+        config = {}
+        
+        # Map common generation parameters
+        if "temperature" in generic_request.generation_params:
+            config["temperature"] = generic_request.generation_params["temperature"]
+        if "top_p" in generic_request.generation_params:
+            config["top_p"] = generic_request.generation_params["top_p"]
+        if "max_tokens" in generic_request.generation_params:
+            config["max_tokens"] = generic_request.generation_params["max_tokens"]
+        if "stop_sequences" in generic_request.generation_params:
+            config["stop_sequences"] = generic_request.generation_params["stop_sequences"]
+            
+        # Add config if not empty
+        if config:
+            request_body["inferenceConfig"] = config
+            
+        return request_body
+        
+    def _extract_converse_response(self, response_body: dict) -> t.Tuple[str, _TokenUsage]:
+        """Extract text response and token usage from the Converse API response.
+        
+        Args:
+            response_body: The response body from the Converse API
+            
+        Returns:
+            Tuple of (text_response, token_usage)
+        """
+        # Default values
+        text_response = ""
+        input_tokens = 0
+        output_tokens = 0
+        
+        # Extract the response content
+        if "output" in response_body:
+            output = response_body["output"]
+            
+            # Get message content
+            if "message" in output:
+                message = output["message"]
+                
+                # Extract content from message
+                if "content" in message:
+                    content_items = message["content"]
+                    
+                    # Combine all text content
+                    text_parts = []
+                    for item in content_items:
+                        if "text" in item:
+                            text_parts.append(item["text"])
+                            
+                    text_response = "\n".join(text_parts)
+            
+            # Get usage information
+            if "usage" in output:
+                usage = output["usage"]
+                input_tokens = usage.get("input_tokens", 0)
+                output_tokens = usage.get("output_tokens", 0)
+                
+        # Create token usage object
+        token_usage = _TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+        
+        return text_response, token_usage
+
     def create_api_specific_request_online(self, generic_request: GenericRequest) -> dict:
         """Create a model-specific request from a generic request for online inference.
         
@@ -611,7 +774,11 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         # Handle multimodal prompts
         generic_request = self._unpack_multimodal(generic_request)
         
-        # Format request based on model provider
+        # Check if we should use the Converse API for this model
+        if self._supports_converse_api():
+            return self._format_converse_request(generic_request)
+        
+        # Fall back to provider-specific formatting for invoke_model API
         if self.model_provider == "anthropic":
             return self._format_anthropic_request(generic_request)
         elif self.model_provider == "amazon":
@@ -650,20 +817,39 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         api_request = json.dumps(request.api_specific_request)
         
         try:
-            # Call Bedrock API using boto3 (synchronously, but within an async context)
-            response = await asyncio.to_thread(
-                self.bedrock_runtime.invoke_model,
-                modelId=self.model_id,
-                body=api_request,
-                contentType="application/json",
-                accept="application/json",
-            )
+            # Determine if we should use the Converse API
+            use_converse = self._supports_converse_api()
             
-            # Process the response body
-            response_body = json.loads(response.get("body").read().decode("utf-8"))
-            
-            # Extract response based on model provider
-            text_response, token_usage = self._extract_response_by_provider(response_body, request)
+            if use_converse:
+                # Call Bedrock Converse API
+                response = await asyncio.to_thread(
+                    self.bedrock_runtime.converse,
+                    modelId=self.model_id,
+                    body=api_request,
+                    contentType="application/json",
+                    accept="application/json",
+                )
+                
+                # Process the response body
+                response_body = json.loads(response.get("body").read().decode("utf-8"))
+                
+                # Extract response from the converse format
+                text_response, token_usage = self._extract_converse_response(response_body)
+            else:
+                # Call standard Bedrock invoke_model API
+                response = await asyncio.to_thread(
+                    self.bedrock_runtime.invoke_model,
+                    modelId=self.model_id,
+                    body=api_request,
+                    contentType="application/json",
+                    accept="application/json",
+                )
+                
+                # Process the response body
+                response_body = json.loads(response.get("body").read().decode("utf-8"))
+                
+                # Extract response based on model provider
+                text_response, token_usage = self._extract_response_by_provider(response_body, request)
             
             # Calculate processing time
             processing_time = (datetime.datetime.now() - start_time).total_seconds()
@@ -809,4 +995,32 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         # Create token usage object
         token_usage = _TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
         
-        return text_response, token_usage 
+        return text_response, token_usage
+
+    def _supports_converse_api(self) -> bool:
+        """Determine if the model supports the Converse API.
+        
+        Returns:
+            True if the model supports the Converse API, False otherwise
+        """
+        if not self.use_converse_api:
+            return False
+            
+        # Check if using inference profile
+        if self.model_id.startswith("us."):
+            # Strip "us." prefix to check against the list
+            base_model_id = self.model_id[3:]
+            for model in self.CONVERSE_SUPPORTED_MODELS:
+                if base_model_id == model or model in base_model_id:
+                    return True
+            return False
+            
+        # For regular model IDs
+        model_base = self.model_id.split(":")[0] if ":" in self.model_id else self.model_id
+        
+        for supported_model in self.CONVERSE_SUPPORTED_MODELS:
+            supported_base = supported_model.split(":")[0] if ":" in supported_model else supported_model
+            if model_base == supported_base or model_base in supported_model:
+                return True
+                
+        return False 
