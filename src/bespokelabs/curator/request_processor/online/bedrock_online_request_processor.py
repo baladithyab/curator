@@ -27,6 +27,7 @@ from bespokelabs.curator.status_tracker.online_status_tracker import OnlineStatu
 from bespokelabs.curator.types.generic_request import GenericRequest
 from bespokelabs.curator.types.generic_response import GenericResponse
 from bespokelabs.curator.types.token_usage import _TokenUsage
+from bespokelabs.curator.utils.image_utils import get_file_size, resize_image
 
 
 class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
@@ -38,22 +39,62 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
     Args:
         config: Configuration for the request processor
         region_name: AWS region to use for Bedrock API calls
+        use_inference_profile: Whether to use inference profiles instead of direct model IDs
     """
 
-    def __init__(self, config: OnlineRequestProcessorConfig, region_name: str = None):
+    # List of cross-region inference profiles
+    INFERENCE_PROFILES = [
+        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-micro-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.anthropic.claude-3-haiku-20240307-v1:0",
+        "us.anthropic.claude-3-opus-20240229-v1:0",
+        "us.anthropic.claude-3-sonnet-20240229-v1:0",
+        "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "us.meta.llama3-1-8b-instruct-v1:0",
+        "us.meta.llama3-1-70b-instruct-v1:0",
+        "us.meta.llama3-1-405b-instruct-v1:0",
+        "us.meta.llama3-2-1b-instruct-v1:0",
+        "us.meta.llama3-2-3b-instruct-v1:0",
+        "us.meta.llama3-2-11b-instruct-v1:0",
+        "us.meta.llama3-2-90b-instruct-v1:0",
+        "us.meta.llama3-3-70b-instruct-v1:0",
+    ]
+
+    def __init__(
+        self, 
+        config: OnlineRequestProcessorConfig,
+        region_name: str = None,
+        use_inference_profile: bool = False,
+    ):
         """Initialize the BedrockOnlineRequestProcessor."""
         super().__init__(config)
         
-        # Initialize Bedrock client
+        # Initialize AWS Bedrock client
         self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
-        self.bedrock_runtime = boto3.client(
-            service_name="bedrock-runtime",
-            region_name=self.region_name,
-        )
+        self.client = boto3.client('bedrock-runtime', region_name=self.region_name)
+        self.bedrock = boto3.client('bedrock', region_name=self.region_name)
         
-        # Configure model specific settings based on model ID
+        # Store model ID and determine provider
         self.model_id = config.model
+        self.use_inference_profile = use_inference_profile
+        
+        # If using inference profiles, check if the model ID is already a profile or needs conversion
+        if self.use_inference_profile:
+            self.model_id = self._get_inference_profile_id(self.model_id)
+            
         self.model_provider = self._determine_model_provider()
+        
+        # Provider-specific settings
+        self.max_image_size_mb = self._get_max_image_size()
+        
+        logger.info(f"Initialized AWS Bedrock processor for model {self.model_id} " 
+                   f"({self.model_provider}) in region {self.region_name}")
+        if self.use_inference_profile:
+            logger.info(f"Using inference profile: {self.model_id}")
         
         # Set up default prompt formatters based on model provider
         self.prompt_formatters = {
@@ -83,6 +124,37 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             ),
         }
 
+    def _get_inference_profile_id(self, model_id: str) -> str:
+        """Convert a standard model ID to an inference profile ID if possible.
+        
+        Args:
+            model_id: The model ID to convert
+            
+        Returns:
+            The inference profile ID if available, otherwise the original model ID
+        """
+        # If already an inference profile, return as is
+        if model_id.startswith("us."):
+            if model_id in self.INFERENCE_PROFILES:
+                logger.info(f"Using inference profile: {model_id}")
+                return model_id
+            else:
+                logger.warning(f"Unknown inference profile: {model_id}, will use as provided")
+                return model_id
+                
+        # Try to find a matching inference profile
+        base_model_name = model_id.split(":")[0] if ":" in model_id else model_id
+        
+        for profile in self.INFERENCE_PROFILES:
+            # Check if the profile contains the base model name
+            if base_model_name in profile:
+                logger.info(f"Converting {model_id} to inference profile: {profile}")
+                return profile
+                
+        # No matching profile found, use the model ID as is
+        logger.warning(f"No matching inference profile found for {model_id}, using standard model ID")
+        return model_id
+
     def _determine_model_provider(self) -> str:
         """Determine the model provider based on the model ID.
         
@@ -90,6 +162,10 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             The model provider as a string
         """
         model_id_lower = self.model_id.lower()
+        
+        # For inference profiles, strip the 'us.' prefix for provider detection
+        if model_id_lower.startswith("us."):
+            model_id_lower = model_id_lower[3:]
         
         if any(p in model_id_lower for p in ["claude", "anthropic"]):
             return "anthropic"
@@ -107,6 +183,21 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             logger.warning(f"Unknown model provider for model: {self.model_id}, defaulting to amazon")
             return "amazon"
 
+    def _get_max_image_size(self) -> float:
+        """Get the maximum image size in MB for the model provider.
+        
+        Returns:
+            Maximum image size in MB
+        """
+        if self.model_provider == "anthropic":
+            return 5.0  # Claude models support up to 5MB per image
+        elif self.model_provider == "amazon":
+            return 5.0  # Amazon Titan models
+        elif self.model_provider == "meta":
+            return 5.0  # Meta Llama models
+        else:
+            return 4.0  # Default conservative limit for other providers
+            
     @property
     def backend(self) -> str:
         """Return the backend name.
@@ -136,27 +227,24 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         if not self.model_id:
             raise ValueError("Model ID is required for AWS Bedrock")
 
-    def file_upload_limit_check(self, base64_image: str) -> None:
-        """Check if an image file is within upload limits.
+    def file_upload_limit_check(self, file_paths: t.List[str]) -> bool:
+        """Check if files meet size limits for the model.
         
         Args:
-            base64_image: Base64 encoded image data
+            file_paths: List of file paths to check
             
-        Raises:
-            ValueError: If image exceeds size limits
+        Returns:
+            True if all files meet size limits, False otherwise
         """
-        # Different model providers have different size limits
-        # These are approximate limits - check AWS Bedrock documentation for the latest values
-        max_size_mb = 4  # Default 4MB for most models
-        
-        if self.model_provider == "anthropic":
-            max_size_mb = 5  # Claude has ~5MB limit
-        
-        # Calculate size in MB
-        size_mb = len(base64_image) * 3 / 4 / (1024 * 1024)
-        
-        if size_mb > max_size_mb:
-            raise ValueError(f"Image size ({size_mb:.2f}MB) exceeds the maximum allowed size ({max_size_mb}MB)")
+        for file_path in file_paths:
+            file_size_mb = get_file_size(file_path) / (1024 * 1024)
+            if file_size_mb > self.max_image_size_mb:
+                logger.warning(
+                    f"File {file_path} exceeds {self.model_provider} size limit: "
+                    f"{file_size_mb:.2f}MB > {self.max_image_size_mb}MB"
+                )
+                return False
+        return True
 
     def estimate_total_tokens(self, messages: list) -> _TokenUsage:
         """Estimate token usage for the given messages.

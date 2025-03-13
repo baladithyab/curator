@@ -105,6 +105,66 @@ def run_claude_batch_example():
         else:
             print(f"No results found for batch {i}")
 
+def run_inference_profile_batch_example():
+    """Run a batch example using Claude with an inference profile for cross-region availability."""
+    if not check_environment():
+        return
+        
+    print("\n=== Running Inference Profile Batch Example ===")
+    print("Note: Inference profiles require appropriate AWS permissions and configuration.")
+    
+    # Create some sample requests
+    requests = []
+    for i in range(3):
+        request = curator.GenericRequest(
+            task_id=i,
+            prompt=f"Explain the concept of {['distributed computing', 'edge computing', 'cloud-native architecture'][i]} in 2-3 sentences.",
+            generation_params={
+                "temperature": 0.7,
+                "max_tokens": 300
+            }
+        )
+        requests.append(request)
+    
+    # Create a temporary directory for batch files
+    import tempfile
+    working_dir = tempfile.mkdtemp()
+    
+    # Create request file
+    file_path = os.path.join(working_dir, "profile_batch.jsonl")
+    with open(file_path, "w") as f:
+        for request in requests:
+            f.write(curator.json.dumps(request.to_dict()) + "\n")
+    
+    try:
+        # Get the batch processor with inference profile
+        processor = curator.get_request_processor(
+            model_name="anthropic.claude-3-haiku-20240307-v1:0",  # Will be converted to profile
+            backend="bedrock",
+            batch=True,
+            generation_params={"temperature": 0.7, "max_tokens": 300},
+            use_inference_profile=True  # This enables the use of inference profiles
+        )
+        
+        # Process the batch
+        print(f"Processing batch with inference profile...")
+        processor.requests_to_responses([file_path])
+        
+        # Read and print the results
+        result_path = file_path.replace(".jsonl", "_responses.jsonl")
+        if os.path.exists(result_path):
+            print(f"\nResults with inference profile:")
+            with open(result_path, "r") as f:
+                for j, line in enumerate(f):
+                    response = curator.json.loads(line)
+                    print(f"\nPrompt: {requests[j].prompt}")
+                    print(f"Response: {response.get('response')}")
+        else:
+            print(f"No results found for inference profile batch")
+            
+    except Exception as e:
+        print(f"Error processing inference profile batch: {str(e)}")
+
 def run_cross_provider_batch_example():
     """Run multiple batch examples with different providers."""
     if not check_environment():
@@ -114,14 +174,16 @@ def run_cross_provider_batch_example():
     models = [
         {"name": "anthropic.claude-3-haiku-20240307-v1:0", "provider": "Claude"},
         {"name": "amazon.titan-text-express-v1", "provider": "Amazon Titan"},
-        {"name": "meta.llama3-1-8b-instruct-v1:0", "provider": "Meta Llama"}
+        {"name": "meta.llama3-1-8b-instruct-v1:0", "provider": "Meta Llama"},
+        {"name": "mistral.mistral-large-2402-v1:0", "provider": "Mistral Small"}  # Updated to use officially supported model
     ]
     
     # Create sample prompts
     prompts = [
         "Explain the concept of microservices in software architecture.",
         "What are the key benefits of serverless computing?",
-        "How does containerization improve application deployment?"
+        "How does containerization improve application deployment?",
+        "Describe the advantages of using distributed computing systems."
     ]
     
     # Create a temporary directory for batch files
@@ -190,8 +252,11 @@ def main():
         return
     
     try:
-        # Run the batch example with Claude
+        # Run the batch examples
         run_claude_batch_example()
+        
+        # Run inference profile example
+        run_inference_profile_batch_example()
     except Exception as e:
         print(f"Error running examples: {str(e)}")
         print("Make sure you have access to the specified models in AWS Bedrock.")

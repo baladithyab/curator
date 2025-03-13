@@ -69,6 +69,35 @@ def run_auto_detected_example():
     response = processor.generate("What are the benefits of serverless architecture?")
     print(f"Response with auto-detected backend:\n{response}")
 
+# Run with inference profile
+def run_inference_profile_example():
+    """Run an example using an inference profile for cross-region availability."""
+    print("\n=== Running with Inference Profile ===")
+    # Use the cross-region inference profile variant
+    processor = curator.get_request_processor(
+        model_name="us.anthropic.claude-3-haiku-20240307-v1:0",  # Direct inference profile
+        backend="bedrock",
+        generation_params={"temperature": 0.7, "max_tokens": 500}
+    )
+    
+    response = processor.generate("What are the advantages of using inference profiles in AWS Bedrock?")
+    print(f"Response with explicit inference profile:\n{response}")
+
+# Run with automatic conversion to inference profile
+def run_auto_inference_profile_example():
+    """Run an example with automatic conversion to inference profile."""
+    print("\n=== Running with Auto-conversion to Inference Profile ===")
+    # Standard model ID with use_inference_profile flag
+    processor = curator.get_request_processor(
+        model_name="anthropic.claude-3-haiku-20240307-v1:0",  # Will be converted to profile
+        backend="bedrock",
+        generation_params={"temperature": 0.7, "max_tokens": 500},
+        use_inference_profile=True  # This enables auto-conversion
+    )
+    
+    response = processor.generate("Explain the concept of geo-distributed inference and its benefits.")
+    print(f"Response with auto-converted inference profile:\n{response}")
+
 # Main function to run all examples
 def main():
     print("AWS Bedrock Online Inference Examples")
@@ -84,6 +113,14 @@ def main():
         run_titan_example()
         run_llama_example()
         run_auto_detected_example()
+        
+        # Run the inference profile examples
+        print("\n=== Inference Profile Examples ===")
+        print("Note: Inference profiles require appropriate AWS permissions and configuration.")
+        
+        run_inference_profile_example()
+        run_auto_inference_profile_example()
+        
     except Exception as e:
         print(f"Error running examples: {str(e)}")
         print("Make sure you have access to the specified models in AWS Bedrock.")

@@ -68,6 +68,7 @@ class _RequestProcessorFactory:
         # AWS Bedrock models (with provider prefix or bedrock in the name)
         bedrock_prefixes = [
             "amazon.", "anthropic.", "ai21.", "cohere.", "meta.", "mistral.",  # Provider prefixes
+            "us.amazon.", "us.anthropic.", "us.meta."  # Inference profile prefixes
         ]
         if any(model_name.startswith(prefix) for prefix in bedrock_prefixes) or "bedrock" in model_name:
             logger.info(f"Requesting output from {model_name}, using AWS Bedrock backend")
@@ -165,7 +166,16 @@ class _RequestProcessorFactory:
             # Get region name from environment or params
             region_name = os.environ.get("AWS_REGION") or params.get("region_name")
             
-            _request_processor = BedrockOnlineRequestProcessor(config, region_name=region_name)
+            # Check if we should use inference profiles
+            use_inference_profile = params.get("use_inference_profile", False)
+            if use_inference_profile is None:
+                use_inference_profile = os.environ.get("BEDROCK_USE_INFERENCE_PROFILE", "").lower() == "true"
+            
+            _request_processor = BedrockOnlineRequestProcessor(
+                config, 
+                region_name=region_name,
+                use_inference_profile=use_inference_profile
+            )
         elif backend == "bedrock" and batch:
             from bespokelabs.curator.request_processor.batch.bedrock_batch_request_processor import BedrockBatchRequestProcessor
             
@@ -175,12 +185,18 @@ class _RequestProcessorFactory:
             s3_prefix = os.environ.get("BEDROCK_BATCH_S3_PREFIX") or params.get("s3_prefix")
             role_arn = os.environ.get("BEDROCK_BATCH_ROLE_ARN") or params.get("role_arn")
             
+            # Check if we should use inference profiles
+            use_inference_profile = params.get("use_inference_profile", False)
+            if use_inference_profile is None:
+                use_inference_profile = os.environ.get("BEDROCK_USE_INFERENCE_PROFILE", "").lower() == "true"
+            
             _request_processor = BedrockBatchRequestProcessor(
                 config, 
                 region_name=region_name,
                 s3_bucket=s3_bucket,
                 s3_prefix=s3_prefix,
-                role_arn=role_arn
+                role_arn=role_arn,
+                use_inference_profile=use_inference_profile
             )
         elif backend == "litellm" and batch:
             raise ValueError("Batch mode is not supported with LiteLLM backend")
