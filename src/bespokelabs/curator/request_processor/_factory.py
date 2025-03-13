@@ -60,9 +60,18 @@ class _RequestProcessorFactory:
             logger.info(f"Requesting text output from {model_name}, using OpenAI backend")
             return "openai"
 
-        if "claude" in model_name:
+        # Claude models from Anthropic should use Anthropic backend
+        if "claude" in model_name and not any(x in model_name for x in ["amazon", "bedrock"]):
             logger.info(f"Requesting output from {model_name}, using Anthropic backend")
             return "anthropic"
+            
+        # AWS Bedrock models (with provider prefix or bedrock in the name)
+        bedrock_prefixes = [
+            "amazon.", "anthropic.", "ai21.", "cohere.", "meta.", "mistral.",  # Provider prefixes
+        ]
+        if any(model_name.startswith(prefix) for prefix in bedrock_prefixes) or "bedrock" in model_name:
+            logger.info(f"Requesting output from {model_name}, using AWS Bedrock backend")
+            return "bedrock"
 
         # Default to LiteLLM for all other cases
         logger.info(f"Requesting {'structured' if response_format else 'text'} output from {model_name}, using LiteLLM backend")
@@ -146,6 +155,29 @@ class _RequestProcessorFactory:
             from bespokelabs.curator.request_processor.online.anthropic_online_request_processor import AnthropicOnlineRequestProcessor
 
             _request_processor = AnthropicOnlineRequestProcessor(config)
+        elif backend == "bedrock" and not batch:
+            from bespokelabs.curator.request_processor.online.bedrock_online_request_processor import BedrockOnlineRequestProcessor
+            
+            # Get region name from environment or params
+            region_name = os.environ.get("AWS_REGION") or params.get("region_name")
+            
+            _request_processor = BedrockOnlineRequestProcessor(config, region_name=region_name)
+        elif backend == "bedrock" and batch:
+            from bespokelabs.curator.request_processor.batch.bedrock_batch_request_processor import BedrockBatchRequestProcessor
+            
+            # Get region name, S3 bucket, and IAM role from environment or params
+            region_name = os.environ.get("AWS_REGION") or params.get("region_name")
+            s3_bucket = os.environ.get("BEDROCK_BATCH_S3_BUCKET") or params.get("s3_bucket")
+            s3_prefix = os.environ.get("BEDROCK_BATCH_S3_PREFIX") or params.get("s3_prefix")
+            role_arn = os.environ.get("BEDROCK_BATCH_ROLE_ARN") or params.get("role_arn")
+            
+            _request_processor = BedrockBatchRequestProcessor(
+                config, 
+                region_name=region_name,
+                s3_bucket=s3_bucket,
+                s3_prefix=s3_prefix,
+                role_arn=role_arn
+            )
         elif backend == "litellm" and batch:
             raise ValueError("Batch mode is not supported with LiteLLM backend")
         elif backend == "litellm":
