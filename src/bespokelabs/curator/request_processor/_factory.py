@@ -62,6 +62,7 @@ class _RequestProcessorFactory:
         # AWS Bedrock models (with provider prefix or bedrock in the name)
         bedrock_prefixes = [
             "amazon.", "anthropic.", "ai21.", "cohere.", "meta.", "mistral.",  # Provider prefixes
+            "us.amazon.", "us.anthropic.", "us.meta."  # Inference profile prefixes
         ]
         if any(model_name.startswith(prefix) for prefix in bedrock_prefixes) or "bedrock" in model_name:
             logger.info(f"Requesting output from {model_name}, using AWS Bedrock backend")

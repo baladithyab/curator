@@ -37,7 +37,67 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         s3_bucket: S3 bucket to use for input/output data (required for batch)
         s3_prefix: Prefix to use for S3 objects within the bucket
         role_arn: IAM role ARN with necessary permissions for Bedrock batch jobs
+        use_inference_profile: Whether to use inference profiles instead of direct model IDs
     """
+
+    # List of models known to support batch inference in AWS Bedrock
+    # This list should be updated as AWS adds support for more models
+    BATCH_SUPPORTED_MODELS = [
+        # Anthropic Claude models
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "anthropic.claude-3-opus-20240229-v1:0",
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        
+        # Amazon models
+        "amazon.titan-text-express-v1",
+        "amazon.titan-text-lite-v1",
+        "amazon.titan-embed-text-v1",
+        
+        # Meta Llama models
+        "meta.llama3-1-8b-instruct-v1:0",
+        "meta.llama3-1-70b-instruct-v1:0",
+        "meta.llama3-1-405b-instruct-v1:0",
+        "meta.llama3-2-1b-instruct-v1:0",
+        "meta.llama3-2-3b-instruct-v1:0",
+        "meta.llama3-2-11b-instruct-v1:0",
+        "meta.llama3-2-90b-instruct-v1:0",
+        "meta.llama3-3-70b-instruct-v1:0",
+        
+        # Mistral AI models
+        "mistral.mistral-large-2402-v1:0",  # Mistral Small (24.02)
+        "mistral.mistral-large-2407-v1:0",  # Mistral Large (24.07)
+        
+        # Note: The following Mistral models may work but aren't explicitly listed
+        # in AWS documentation as supporting batch inference
+        "mistral.mistral-7b-instruct-v0:2",
+        "mistral.mixtral-8x7b-instruct-v0:1",
+    ]
+
+    # List of cross-region inference profiles
+    INFERENCE_PROFILES = [
+        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-micro-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.anthropic.claude-3-haiku-20240307-v1:0",
+        "us.anthropic.claude-3-opus-20240229-v1:0",
+        "us.anthropic.claude-3-sonnet-20240229-v1:0",
+        "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "us.meta.llama3-1-8b-instruct-v1:0",
+        "us.meta.llama3-1-70b-instruct-v1:0",
+        "us.meta.llama3-1-405b-instruct-v1:0",
+        "us.meta.llama3-2-1b-instruct-v1:0",
+        "us.meta.llama3-2-3b-instruct-v1:0",
+        "us.meta.llama3-2-11b-instruct-v1:0",
+        "us.meta.llama3-2-90b-instruct-v1:0",
+        "us.meta.llama3-3-70b-instruct-v1:0",
+    ]
 
     def __init__(
         self, 
@@ -46,6 +106,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         s3_bucket: str = None,
         s3_prefix: str = None,
         role_arn: str = None,
+        use_inference_profile: bool = False,
     ):
         """Initialize the BedrockBatchRequestProcessor."""
         super().__init__(config)
@@ -69,9 +130,77 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         
         # Batch job tracking
         self.model_id = config.model
+        self.use_inference_profile = use_inference_profile
+
+        # If using inference profiles, check if the model ID is already a profile or needs conversion
+        if self.use_inference_profile:
+            self.model_id = self._get_inference_profile_id(self.model_id)
+
+        # Check if model supports batch inference
+        self._validate_batch_support()
+        
+        # Determine model provider
         self.model_provider = self._determine_model_provider()
         self.timeout_hours = 24  # Default timeout in hours
         self.batch_jobs = {}  # Track batch jobs: {batch_id: job_details}
+
+    def _get_inference_profile_id(self, model_id: str) -> str:
+        """Convert a standard model ID to an inference profile ID if possible.
+        
+        Args:
+            model_id: The model ID to convert
+            
+        Returns:
+            The inference profile ID if available, otherwise the original model ID
+        """
+        # If already an inference profile, return as is
+        if model_id.startswith("us."):
+            if model_id in self.INFERENCE_PROFILES:
+                logger.info(f"Using inference profile: {model_id}")
+                return model_id
+            else:
+                logger.warning(f"Unknown inference profile: {model_id}, will use as provided")
+                return model_id
+                
+        # Try to find a matching inference profile
+        base_model_name = model_id.split(":")[0] if ":" in model_id else model_id
+        
+        for profile in self.INFERENCE_PROFILES:
+            # Check if the profile contains the base model name
+            if base_model_name in profile:
+                logger.info(f"Converting {model_id} to inference profile: {profile}")
+                return profile
+                
+        # No matching profile found, use the model ID as is
+        logger.warning(f"No matching inference profile found for {model_id}, using standard model ID")
+        return model_id
+
+    def _validate_batch_support(self) -> None:
+        """Validate that the model supports batch inference.
+        
+        Raises:
+            ValueError: If the model does not support batch inference
+        """
+        # Skip validation for inference profiles as they're designed for distribution
+        if self.model_id.startswith("us."):
+            return
+            
+        # Check if the model is in the list of supported models
+        model_base = self.model_id.split(":")[0] if ":" in self.model_id else self.model_id
+        
+        if not any(model_base in supported_model for supported_model in self.BATCH_SUPPORTED_MODELS):
+            # Try checking with the AWS Bedrock API to see if the model is batch-enabled
+            try:
+                response = self.bedrock.get_foundation_model(
+                    modelIdentifier=self.model_id
+                )
+                if not response.get("inferenceTypesSupported") or "ON_DEMAND" not in response.get("inferenceTypesSupported"):
+                    logger.warning(f"Model {self.model_id} may not support batch inference according to AWS API")
+            except Exception as e:
+                logger.warning(f"Could not verify batch support via AWS API: {str(e)}")
+            
+            logger.warning(f"Model {self.model_id} is not in the list of known batch-supported models")
+            logger.warning("This may still work if AWS has recently added batch support for this model")
 
     def _determine_model_provider(self) -> str:
         """Determine the model provider based on the model ID.
@@ -80,6 +209,10 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             The model provider as a string
         """
         model_id_lower = self.model_id.lower()
+        
+        # For inference profiles, strip the 'us.' prefix for provider detection
+        if model_id_lower.startswith("us."):
+            model_id_lower = model_id_lower[3:]
         
         if any(p in model_id_lower for p in ["claude", "anthropic"]):
             return "anthropic"
@@ -431,6 +564,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 "job_id": job_id,
                 "job_arn": job_response.get("jobArn"),
                 "model_id": self.model_id,
+                "using_inference_profile": self.use_inference_profile,
                 "s3_input_uri": s3_input_uri,
                 "s3_output_uri": s3_output_uri,
                 "submission_time": datetime.datetime.now().isoformat()
