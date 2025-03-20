@@ -171,16 +171,10 @@ class _RequestProcessorFactory:
             if use_inference_profile is None:
                 use_inference_profile = os.environ.get("BEDROCK_USE_INFERENCE_PROFILE", "").lower() == "true"
             
-            # Check if we should use the Converse API when available
-            use_converse_api = params.get("use_converse_api", False)
-            if use_converse_api is None:
-                use_converse_api = os.environ.get("BEDROCK_USE_CONVERSE_API", "").lower() == "true"
-            
             _request_processor = BedrockOnlineRequestProcessor(
                 config, 
                 region_name=region_name,
-                use_inference_profile=use_inference_profile,
-                use_converse_api=use_converse_api
+                use_inference_profile=use_inference_profile
             )
         elif backend == "bedrock" and batch:
             from bespokelabs.curator.request_processor.batch.bedrock_batch_request_processor import BedrockBatchRequestProcessor
