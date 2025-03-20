@@ -1,6 +1,10 @@
 """Example of using AWS Bedrock with Curator for online inference.
 
 This example demonstrates how to use different AWS Bedrock models for text generation.
+The BedrockOnlineRequestProcessor automatically uses the Converse API for supported
+models (like Claude, Llama, and Titan) to provide better chat capabilities and 
+consistent message formatting.
+
 Before running this example, make sure you have the required AWS credentials set up.
 
 Required environment variables:
@@ -12,150 +16,137 @@ Required environment variables:
 import os
 from bespokelabs import curator
 
+import boto3
+
 # Set the AWS region if not already set in environment
 if not os.environ.get("AWS_REGION"):
-    os.environ["AWS_REGION"] = "us-east-1"
+    os.environ["AWS_REGION"] = "us-west-2"
 
-# Get the request processor for AWS Bedrock with Claude model
+def check_environment():
+    """Check if AWS credentials are properly configured."""
+    try:
+        # Test if we can access AWS credentials (including role-based credentials)
+        sts = boto3.client('sts')
+        identity = sts.get_caller_identity()
+        print(f"Using AWS credentials for: {identity['Arn']}")
+        return True
+    except Exception as e:
+        print(f"Error accessing AWS credentials: {str(e)}")
+        print("Make sure you have valid AWS credentials configured.")
+        return False
+
 def run_claude_example():
     """Run an example using Claude from AWS Bedrock."""
     print("\n=== Running Claude on AWS Bedrock ===")
-    # Get the processor with explicit 'bedrock' backend
-    processor = curator.get_request_processor(
+    
+    llm = curator.LLM(
         model_name="anthropic.claude-3-sonnet-20240229-v1:0",
         backend="bedrock",
         generation_params={"temperature": 0.7, "max_tokens": 500}
     )
     
-    response = processor.generate("Write a limerick about cloud computing.")
-    print(f"Response from Claude on AWS Bedrock:\n{response}")
+    messages = [{
+        "role": "user",
+        "content": [{"text": "Write a limerick about cloud computing."}]
+    }]
+    response = llm([messages])
+    print(f"Response from Claude on AWS Bedrock:\n{response[0]['response']}")
 
-# Get the request processor for AWS Bedrock with Titan model
+def run_claude_chat_example():
+    """Run a chat example using Claude from AWS Bedrock."""
+    print("\n=== Running Claude Chat Example on AWS Bedrock ===")
+    
+    llm = curator.LLM(
+        model_name="anthropic.claude-3-sonnet-20240229-v1:0",
+        backend="bedrock",
+        generation_params={"temperature": 0.7, "max_tokens": 500}
+    )
+    
+    messages = [
+        {
+            "role": "system",
+            "content": [{"text": "You are a helpful AI assistant that specializes in explaining AWS services."}]
+        },
+        {
+            "role": "user",
+            "content": [{"text": "Can you explain the benefits of using AWS Bedrock?"}]
+        }
+    ]
+    
+    response = llm([messages])
+    print(f"Response from Claude Chat:\n{response[0]['response']}")
+
 def run_titan_example():
     """Run an example using Amazon Titan from AWS Bedrock."""
     print("\n=== Running Amazon Titan on AWS Bedrock ===")
-    processor = curator.get_request_processor(
+    
+    llm = curator.LLM(
         model_name="amazon.titan-text-express-v1",
         backend="bedrock",
         generation_params={"temperature": 0.7, "max_tokens": 500}
     )
     
-    response = processor.generate("Write a short poem about machine learning.")
-    print(f"Response from Amazon Titan on AWS Bedrock:\n{response}")
+    messages = [{
+        "role": "user",
+        "content": [{"text": "Write a short poem about machine learning."}]
+    }]
+    response = llm([messages])
+    print(f"Response from Amazon Titan:\n{response[0]['response']}")
 
-# Get the request processor for AWS Bedrock with Llama model
 def run_llama_example():
     """Run an example using Meta Llama from AWS Bedrock."""
     print("\n=== Running Meta Llama on AWS Bedrock ===")
-    processor = curator.get_request_processor(
+    
+    llm = curator.LLM(
         model_name="meta.llama3-1-8b-instruct-v1:0",  # Use smaller model for example
         backend="bedrock",
         generation_params={"temperature": 0.7, "max_tokens": 500}
     )
     
-    response = processor.generate("Explain how transformers work in deep learning.")
-    print(f"Response from Meta Llama on AWS Bedrock:\n{response}")
+    messages = [{
+        "role": "user",
+        "content": [{"text": "Explain how transformers work in deep learning."}]
+    }]
+    response = llm([messages])
+    print(f"Response from Meta Llama:\n{response[0]['response']}")
 
-# Run with auto-detected model (using model name prefix)
-def run_auto_detected_example():
-    """Run an example with auto-detected backend based on model ID."""
-    print("\n=== Running with Auto-detected Backend ===")
-    # The factory will automatically detect this as a Bedrock model
-    processor = curator.get_request_processor(
-        model_name="anthropic.claude-3-haiku-20240307-v1:0",
-        generation_params={"temperature": 0.7, "max_tokens": 500}
-    )
-    
-    response = processor.generate("What are the benefits of serverless architecture?")
-    print(f"Response with auto-detected backend:\n{response}")
-
-# Run with inference profile
 def run_inference_profile_example():
     """Run an example using an inference profile for cross-region availability."""
     print("\n=== Running with Inference Profile ===")
-    # Use the cross-region inference profile variant
-    processor = curator.get_request_processor(
-        model_name="us.anthropic.claude-3-haiku-20240307-v1:0",  # Direct inference profile
-        backend="bedrock",
-        generation_params={"temperature": 0.7, "max_tokens": 500}
-    )
+    print("Note: Inference profiles require appropriate AWS permissions and configuration.")
     
-    response = processor.generate("What are the advantages of using inference profiles in AWS Bedrock?")
-    print(f"Response with explicit inference profile:\n{response}")
-
-# Run with automatic conversion to inference profile
-def run_auto_inference_profile_example():
-    """Run an example with automatic conversion to inference profile."""
-    print("\n=== Running with Auto-conversion to Inference Profile ===")
-    # Standard model ID with use_inference_profile flag
-    processor = curator.get_request_processor(
+    llm = curator.LLM(
         model_name="anthropic.claude-3-haiku-20240307-v1:0",  # Will be converted to profile
         backend="bedrock",
         generation_params={"temperature": 0.7, "max_tokens": 500},
-        use_inference_profile=True  # This enables auto-conversion
+        backend_params={"use_inference_profile": True}  # This enables auto-conversion
     )
     
-    response = processor.generate("Explain the concept of geo-distributed inference and its benefits.")
-    print(f"Response with auto-converted inference profile:\n{response}")
+    messages = [{
+        "role": "user",
+        "content": [{"text": "Explain the concept of geo-distributed inference and its benefits."}]
+    }]
+    response = llm([messages])
+    print(f"Response with inference profile:\n{response[0]['response']}")
 
-# Run with Converse API
-def run_converse_api_example():
-    """Run an example using the AWS Bedrock Converse API."""
-    print("\n=== Running with Converse API ===")
-    
-    # Use Claude with the Converse API
-    processor = curator.get_request_processor(
-        model_name="anthropic.claude-3-sonnet-20240229-v1:0",
-        backend="bedrock",
-        generation_params={"temperature": 0.7, "max_tokens": 500},
-        use_converse_api=True  # This enables the Converse API
-    )
-    
-    # Simple message
-    response = processor.generate("What are the benefits of using the Converse API in AWS Bedrock?")
-    print(f"Response with Converse API (simple message):\n{response}")
-    
-    # Using a more structured conversation with a system message
-    conversation = [
-        {"role": "system", "content": "You are a helpful AI assistant that specializes in explaining AWS services."},
-        {"role": "user", "content": "Can you explain the difference between the invoke_model and converse APIs in AWS Bedrock?"}
-    ]
-    
-    response = processor.generate(conversation)
-    print(f"\nResponse with Converse API (structured conversation):\n{response}")
-
-# Main function to run all examples
 def main():
+    """Run the AWS Bedrock online inference examples."""
     print("AWS Bedrock Online Inference Examples")
     
-    # Check for AWS credentials
-    if not os.environ.get("AWS_ACCESS_KEY_ID") or not os.environ.get("AWS_SECRET_ACCESS_KEY"):
-        print("Warning: AWS credentials not found in environment variables.")
-        print("Make sure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set.")
+    if not check_environment():
+        return
     
-    # Run the examples
     try:
+        # Run the examples
         run_claude_example()
+        run_claude_chat_example()
         run_titan_example()
         run_llama_example()
-        run_auto_detected_example()
-        
-        # Run the inference profile examples
-        print("\n=== Inference Profile Examples ===")
-        print("Note: Inference profiles require appropriate AWS permissions and configuration.")
-        
         run_inference_profile_example()
-        run_auto_inference_profile_example()
-        
-        # Run the Converse API example
-        print("\n=== Converse API Example ===")
-        print("Note: Converse API is available for selected models in AWS Bedrock.")
-        
-        run_converse_api_example()
         
     except Exception as e:
         print(f"Error running examples: {str(e)}")
         print("Make sure you have access to the specified models in AWS Bedrock.")
 
 if __name__ == "__main__":
-    main() 
+    main()

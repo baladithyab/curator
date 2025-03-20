@@ -1,7 +1,7 @@
 """AWS Bedrock request processor for online inference.
 
 This module provides a request processor that interfaces with AWS Bedrock
-for real-time inference requests.
+for real-time inference requests, prioritizing the Converse API for chat models.
 """
 
 import asyncio
@@ -11,6 +11,7 @@ import os
 import re
 import typing as t
 from io import BytesIO
+from pathlib import Path
 
 import aiohttp
 import boto3
@@ -19,6 +20,7 @@ from botocore.exceptions import ClientError
 from bespokelabs.curator.llm.prompt_formatter import PromptFormatter
 from bespokelabs.curator.log import logger
 from bespokelabs.curator.request_processor.config import OnlineRequestProcessorConfig
+from bespokelabs.curator.request_processor.event_loop import run_in_event_loop
 from bespokelabs.curator.request_processor.online.base_online_request_processor import (
     APIRequest,
     BaseOnlineRequestProcessor,
@@ -27,57 +29,26 @@ from bespokelabs.curator.status_tracker.online_status_tracker import OnlineStatu
 from bespokelabs.curator.types.generic_request import GenericRequest
 from bespokelabs.curator.types.generic_response import GenericResponse
 from bespokelabs.curator.types.token_usage import _TokenUsage
-from bespokelabs.curator.utils.image_utils import get_file_size, resize_image
 
 
 class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
     """Request processor for AWS Bedrock API.
 
     This class handles making real-time inference requests to the AWS Bedrock API,
-    with support for different model providers hosted on Bedrock.
+    with support for different model providers hosted on Bedrock. It prioritizes
+    using the Converse API for chat-based interactions, as it provides better support
+    for multi-turn conversations and consistent message formatting.
 
     Args:
         config: Configuration for the request processor
         region_name: AWS region to use for Bedrock API calls
         use_inference_profile: Whether to use inference profiles instead of direct model IDs
-        use_converse_api: Whether to use the Converse API when available
     """
 
-    # List of cross-region inference profiles
-    INFERENCE_PROFILES = [
-        # Anthropic Claude models
-        "us.anthropic.claude-3-haiku-20240307-v1:0",
-        "us.anthropic.claude-3-opus-20240229-v1:0",
-        "us.anthropic.claude-3-sonnet-20240229-v1:0",
-        "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
-        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
-        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-        # Amazon models
-        "us.amazon.nova-lite-v1:0",
-        "us.amazon.nova-micro-v1:0",
-        "us.amazon.nova-pro-v1:0",
-        "us.amazon.titan-text-express-v1:0",
-        "us.amazon.titan-text-premier-v1:0",
-        "us.amazon.titan-multimodal-embedding-g1-v1:0",
-        "us.amazon.titan-text-embedding-v2:0",
-        # Meta Llama models
-        "us.meta.llama3-1-8b-instruct-v1:0",
-        "us.meta.llama3-1-70b-instruct-v1:0",
-        "us.meta.llama3-1-405b-instruct-v1:0",
-        "us.meta.llama3-2-1b-instruct-v1:0",
-        "us.meta.llama3-2-3b-instruct-v1:0",
-        "us.meta.llama3-2-11b-instruct-v1:0",
-        "us.meta.llama3-2-90b-instruct-v1:0",
-        "us.meta.llama3-3-70b-instruct-v1:0",
-        # Mistral AI models
-        "us.mistral.mistral-small-2402-v1:0",
-        "us.mistral.mistral-large-2407-v1:0"
-    ]
-
     # List of models that support the Converse API
+    # These models should use Converse API by default for better chat capabilities
     CONVERSE_SUPPORTED_MODELS = [
-        # Anthropic Claude models
+        # Anthropic Claude models - Best support for chat through Converse API
         "anthropic.claude-3-haiku-20240307-v1:0",
         "anthropic.claude-3-opus-20240229-v1:0",
         "anthropic.claude-3-sonnet-20240229-v1:0",
@@ -85,7 +56,8 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         "anthropic.claude-3-5-haiku-20241022-v1:0",
         "anthropic.claude-3-5-sonnet-20241022-v2:0",
         "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        # Meta Llama models
+        
+        # Meta Llama models - Chat-optimized through Converse API
         "meta.llama3-1-8b-instruct-v1:0",
         "meta.llama3-1-70b-instruct-v1:0",
         "meta.llama3-1-405b-instruct-v1:0",
@@ -94,10 +66,12 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         "meta.llama3-2-11b-instruct-v1:0",
         "meta.llama3-2-90b-instruct-v1:0",
         "meta.llama3-3-70b-instruct-v1:0",
-        # Mistral AI models
+        
+        # Mistral AI models - Chat-optimized through Converse API
         "mistral.mistral-small-2402-v1:0",
         "mistral.mistral-large-2407-v1:0",
-        # Amazon models
+        
+        # Amazon models - Basic chat support through Converse API
         "amazon.titan-text-express-v1",
         "amazon.titan-text-premier-v1",
         "amazon.nova-lite-v1:0",
@@ -105,12 +79,33 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         "amazon.nova-pro-v1:0"
     ]
 
+    # List of cross-region inference profiles
+    INFERENCE_PROFILES = [
+        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-micro-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.anthropic.claude-3-haiku-20240307-v1:0",
+        "us.anthropic.claude-3-opus-20240229-v1:0",
+        "us.anthropic.claude-3-sonnet-20240229-v1:0",
+        "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "us.meta.llama3-1-8b-instruct-v1:0",
+        "us.meta.llama3-1-70b-instruct-v1:0",
+        "us.meta.llama3-1-405b-instruct-v1:0",
+        "us.meta.llama3-2-1b-instruct-v1:0",
+        "us.meta.llama3-2-3b-instruct-v1:0",
+        "us.meta.llama3-2-11b-instruct-v1:0",
+        "us.meta.llama3-2-90b-instruct-v1:0",
+        "us.meta.llama3-3-70b-instruct-v1:0",
+    ]
+
     def __init__(
         self, 
         config: OnlineRequestProcessorConfig,
         region_name: str = None,
         use_inference_profile: bool = False,
-        use_converse_api: bool = False,
     ):
         """Initialize the BedrockOnlineRequestProcessor."""
         super().__init__(config)
@@ -123,7 +118,6 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         # Store model ID and determine provider
         self.model_id = config.model
         self.use_inference_profile = use_inference_profile
-        self.use_converse_api = use_converse_api or os.environ.get("BEDROCK_USE_CONVERSE_API", "").lower() == "true"
         
         # If using inference profiles, check if the model ID is already a profile or needs conversion
         if self.use_inference_profile:
@@ -138,36 +132,15 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                    f"({self.model_provider}) in region {self.region_name}")
         if self.use_inference_profile:
             logger.info(f"Using inference profile: {self.model_id}")
-        if self.use_converse_api:
-            logger.info(f"Using Converse API when available")
+
+    @property
+    def _multimodal_prompt_supported(self) -> bool:
+        """Whether this processor supports multimodal prompts.
         
-        # Set up default prompt formatters based on model provider
-        self.prompt_formatters = {
-            "anthropic": PromptFormatter(
-                pre_prompt_format="{prompt}",
-                post_response_format="{response}",
-            ),
-            "amazon": PromptFormatter(
-                pre_prompt_format="{prompt}",
-                post_response_format="{response}",
-            ),
-            "meta": PromptFormatter(
-                pre_prompt_format="{prompt}",
-                post_response_format="{response}",
-            ),
-            "cohere": PromptFormatter(
-                pre_prompt_format="{prompt}",
-                post_response_format="{response}",
-            ),
-            "ai21": PromptFormatter(
-                pre_prompt_format="{prompt}",
-                post_response_format="{response}",
-            ),
-            "mistral": PromptFormatter(
-                pre_prompt_format="{prompt}",
-                post_response_format="{response}",
-            ),
-        }
+        Returns:
+            True since all Bedrock models support multimodal prompts
+        """
+        return True
 
     def _get_inference_profile_id(self, model_id: str) -> str:
         """Convert a standard model ID to an inference profile ID if possible.
@@ -187,7 +160,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                 logger.warning(f"Unknown inference profile: {model_id}, will use as provided")
                 return model_id
                 
-        # Try to find a matching inference profile
+        # T ry to find a matching inference profile
         base_model_name = model_id.split(":")[0] if ":" in model_id else model_id
         
         for profile in self.INFERENCE_PROFILES:
@@ -240,8 +213,6 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             return 5.0  # Amazon Titan models
         elif self.model_provider == "meta":
             return 5.0  # Meta Llama models
-        elif self.model_provider == "mistral":
-            return 5.0  # Mistral models
         else:
             return 4.0  # Default conservative limit for other providers
             
@@ -274,24 +245,21 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         if not self.model_id:
             raise ValueError("Model ID is required for AWS Bedrock")
 
-    def file_upload_limit_check(self, file_paths: t.List[str]) -> bool:
-        """Check if files meet size limits for the model.
+    def file_upload_limit_check(self, base64_image: str) -> None:
+        """Check if the image size is within the allowed limit.
         
         Args:
-            file_paths: List of file paths to check
+            base64_image: Base64 encoded image data
             
-        Returns:
-            True if all files meet size limits, False otherwise
+        Raises:
+            ValueError: If image size exceeds the limit
         """
-        for file_path in file_paths:
-            file_size_mb = get_file_size(file_path) / (1024 * 1024)
-            if file_size_mb > self.max_image_size_mb:
-                logger.warning(
-                    f"File {file_path} exceeds {self.model_provider} size limit: "
-                    f"{file_size_mb:.2f}MB > {self.max_image_size_mb}MB"
-                )
-                return False
-        return True
+        # Calculate size in MB (4/3 ratio for base64)
+        size_mb = (len(base64_image) * 3/4) / (1024 * 1024)
+        if size_mb > self.max_image_size_mb:
+            raise ValueError(
+                f"Image size {size_mb:.2f}MB exceeds {self.model_provider} limit of {self.max_image_size_mb}MB"
+            )
 
     def estimate_total_tokens(self, messages: list) -> _TokenUsage:
         """Estimate token usage for the given messages.
@@ -349,26 +317,8 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             Dict containing the formatted request
         """
-        if isinstance(generic_request.prompt, list):
-            messages = []
-            
-            # Convert to Claude messages format
-            for message in generic_request.prompt:
-                if isinstance(message, dict):
-                    # Already in message format
-                    messages.append(message)
-                else:
-                    # Single string - treat as user message
-                    messages.append({
-                        "role": "user",
-                        "content": [{"type": "text", "text": message}]
-                    })
-        else:
-            # Single string prompt
-            messages = [{
-                "role": "user",
-                "content": [{"type": "text", "text": generic_request.prompt}]
-            }]
+        # Convert to Claude messages format
+        messages = generic_request.messages
         
         # Prepare the request body
         request_body = {
@@ -398,28 +348,24 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             Dict containing the formatted request
         """
-        if "embed" in self.model_id.lower():
-            # Titan Embeddings format
-            return {
-                "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt)
-            }
-        else:
-            # Titan Text format
-            # Extract generation parameters
-            text_gen_config = {}
-            for param_name, bedrock_name in [
-                ("max_tokens", "maxTokenCount"),
-                ("temperature", "temperature"),
-                ("top_p", "topP"),
-                ("stop_sequences", "stopSequences")
-            ]:
-                if param_name in generic_request.generation_params:
-                    text_gen_config[bedrock_name] = generic_request.generation_params[param_name]
-            
-            return {
-                "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt),
-                "textGenerationConfig": text_gen_config
-            }
+        # Extract generation parameters
+        text_gen_config = {}
+        for param_name, bedrock_name in [
+            ("max_tokens", "maxTokenCount"),
+            ("temperature", "temperature"),
+            ("top_p", "topP"),
+            ("stop_sequences", "stopSequences")
+        ]:
+            if param_name in generic_request.generation_params:
+                text_gen_config[bedrock_name] = generic_request.generation_params[param_name]
+        
+        # Get the text from the messages
+        text = " ".join(msg.get("content", "") for msg in generic_request.messages)
+        
+        return {
+            "inputText": text,
+            "textGenerationConfig": text_gen_config
+        }
 
     def _format_meta_request(self, generic_request: GenericRequest) -> dict:
         """Format a request for Meta Llama models.
@@ -430,25 +376,8 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             Dict containing the formatted request
         """
-        if isinstance(generic_request.prompt, list):
-            # Convert to Llama messages format
-            messages = []
-            for message in generic_request.prompt:
-                if isinstance(message, dict):
-                    # Already in message format
-                    messages.append(message)
-                else:
-                    # Single string - treat as user message
-                    messages.append({
-                        "role": "user",
-                        "content": str(message)
-                    })
-        else:
-            # Single string prompt
-            messages = [{
-                "role": "user",
-                "content": str(generic_request.prompt)
-            }]
+        # Convert to Llama messages format
+        messages = generic_request.messages
         
         # Prepare the request body
         request_body = {
@@ -474,54 +403,13 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             Dict containing the formatted request
         """
-        if "embed" in self.model_id.lower():
-            # Cohere Embed format
-            return {
-                "texts": [generic_request.prompt] if isinstance(generic_request.prompt, str) else [str(generic_request.prompt)],
-                "input_type": "search_document",
-                "truncate": "END"
-            }
-        elif "command-r" in self.model_id.lower():
-            # Command R format
-            if isinstance(generic_request.prompt, list):
-                # Extract chat history
-                chat_history = []
-                for message in generic_request.prompt[:-1]:  # All but the last message
-                    if isinstance(message, dict):
-                        role = "USER" if message.get("role", "").lower() == "user" else "CHATBOT"
-                        content = message.get("content", "")
-                        chat_history.append({"role": role, "message": content})
-                    else:
-                        # Alternate messages as user/chatbot
-                        role = "USER" if len(chat_history) % 2 == 0 else "CHATBOT"
-                        chat_history.append({"role": role, "message": str(message)})
-                
-                # Get the last message as the current query
-                last_message = generic_request.prompt[-1]
-                if isinstance(last_message, dict):
-                    query = last_message.get("content", "")
-                else:
-                    query = str(last_message)
-            else:
-                # Single string prompt, no chat history
-                query = generic_request.prompt
-                chat_history = []
-            
-            # Prepare the request body
-            request_body = {
-                "message": query,
-                "chat_history": chat_history
-            }
-        else:
-            # Command format
-            prompt = generic_request.prompt
-            if isinstance(prompt, list):
-                # Concatenate list elements
-                prompt = "\n".join([str(p) for p in prompt])
-            
-            request_body = {
-                "prompt": prompt
-            }
+        # Extract text from messages
+        text = " ".join(msg.get("content", "") for msg in generic_request.messages)
+        
+        # Command format
+        request_body = {
+            "prompt": text
+        }
         
         # Add optional parameters
         if "temperature" in generic_request.generation_params:
@@ -546,47 +434,17 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             Dict containing the formatted request
         """
-        if "jamba" in self.model_id.lower():
-            # Jamba format (chat-style)
-            if isinstance(generic_request.prompt, list):
-                messages = []
-                for message in generic_request.prompt:
-                    if isinstance(message, dict):
-                        # Already in message format
-                        messages.append(message)
-                    else:
-                        # Single string - treat as user message
-                        messages.append({
-                            "role": "user",
-                            "content": str(message)
-                        })
-            else:
-                # Single string prompt
-                messages = [{
-                    "role": "user",
-                    "content": str(generic_request.prompt)
-                }]
-            
-            request_body = {
-                "messages": messages
-            }
-        else:
-            # Jurassic format
-            prompt = generic_request.prompt
-            if isinstance(prompt, list):
-                # Concatenate list elements
-                prompt = "\n".join([str(p) for p in prompt])
-            
-            request_body = {
-                "prompt": prompt
-            }
-            
-            # Add penalty parameters if specified
-            for penalty in ["countPenalty", "presencePenalty", "frequencyPenalty"]:
-                if penalty in generic_request.generation_params:
-                    request_body[penalty] = {
-                        "scale": generic_request.generation_params[penalty]
-                    }
+        # Jamba format (chat-style)
+        request_body = {
+            "messages": generic_request.messages
+        }
+        
+        # Add penalty parameters if specified
+        for penalty in ["countPenalty", "presencePenalty", "frequencyPenalty"]:
+            if penalty in generic_request.generation_params:
+                request_body[penalty] = {
+                    "scale": generic_request.generation_params[penalty]
+                }
         
         # Add optional parameters
         if "temperature" in generic_request.generation_params:
@@ -609,24 +467,8 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             Dict containing the formatted request
         """
-        if isinstance(generic_request.prompt, list):
-            messages = []
-            for message in generic_request.prompt:
-                if isinstance(message, dict):
-                    # Already in message format
-                    messages.append(message)
-                else:
-                    # Single string - treat as user message
-                    messages.append({
-                        "role": "user",
-                        "content": str(message)
-                    })
-        else:
-            # Single string prompt
-            messages = [{
-                "role": "user",
-                "content": str(generic_request.prompt)
-            }]
+        # Convert to Mistral messages format
+        messages = generic_request.messages
         
         # Prepare the request body
         request_body = {
@@ -646,6 +488,10 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
     def _format_converse_request(self, generic_request: GenericRequest) -> dict:
         """Format a request for the AWS Bedrock Converse API.
         
+        The Converse API is the preferred method for chat-based interactions as it
+        provides better support for multi-turn conversations and consistent message
+        formatting across different model providers.
+        
         Args:
             generic_request: The generic request to format
             
@@ -656,34 +502,24 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         system_message = None
         messages = []
         
-        # Extract messages from the prompt
-        if isinstance(generic_request.prompt, list):
-            for message in generic_request.prompt:
-                if isinstance(message, dict):
-                    role = message.get("role", "user").lower()
-                    content = message.get("content", "")
-                    
-                    # Extract system message if present
-                    if role == "system":
-                        system_message = content
-                        continue
-                        
-                    # Format the message
-                    messages.append({
-                        "role": role,
-                        "content": content if isinstance(content, list) else [{"text": content}]
-                    })
+        # Extract messages from the request
+        for message in generic_request.messages:
+            role = message.get("role", "user").lower()
+            content = message.get("content", "")
+            
+            # Extract system message if present
+            if role == "system":
+                # Extract text from content if it's a list of content items
+                if isinstance(content, list) and len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
+                    system_message = content[0]["text"]
                 else:
-                    # Default to user message for strings
-                    messages.append({
-                        "role": "user",
-                        "content": [{"text": str(message)}]
-                    })
-        else:
-            # Single string prompt becomes a user message
+                    system_message = content if isinstance(content, str) else str(content)
+                continue
+            
+            # Format the message
             messages.append({
-                "role": "user",
-                "content": [{"text": str(generic_request.prompt)}]
+                "role": role,
+                "content": content if isinstance(content, list) else [{"text": content}]
             })
             
         # Create the request body
@@ -698,22 +534,21 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         # Add inference parameters
         config = {}
         
-        # Map common generation parameters
-        if "temperature" in generic_request.generation_params:
-            config["temperature"] = generic_request.generation_params["temperature"]
-        if "top_p" in generic_request.generation_params:
-            config["top_p"] = generic_request.generation_params["top_p"]
-        if "max_tokens" in generic_request.generation_params:
-            config["max_tokens"] = generic_request.generation_params["max_tokens"]
-        if "stop_sequences" in generic_request.generation_params:
-            config["stop_sequences"] = generic_request.generation_params["stop_sequences"]
+        # Set default values for inference parameters
+        params = generic_request.generation_params
+        
+        # Default values based on common model settings
+        config["temperature"] = params.get("temperature", 0.7)  # Standard creative temperature
+        config["topP"] = params.get("top_p", 1.0)  # Default to no nucleus sampling restriction
+        config["maxTokens"] = params.get("max_tokens", 2000)  # Reasonable default length
+        config["stopSequences"] = params.get("stop_sequences", [])  # Empty list by default
             
         # Add config if not empty
         if config:
             request_body["inferenceConfig"] = config
             
         return request_body
-        
+
     def _extract_converse_response(self, response_body: dict) -> t.Tuple[str, _TokenUsage]:
         """Extract text response and token usage from the Converse API response.
         
@@ -727,6 +562,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         text_response = ""
         input_tokens = 0
         output_tokens = 0
+        total_tokens = 0
         
         # Extract the response content
         if "output" in response_body:
@@ -747,250 +583,14 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                             text_parts.append(item["text"])
                             
                     text_response = "\n".join(text_parts)
-            
-            # Get usage information
-            if "usage" in output:
-                usage = output["usage"]
-                input_tokens = usage.get("input_tokens", 0)
-                output_tokens = usage.get("output_tokens", 0)
-                
-        # Create token usage object
-        token_usage = _TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
         
-        return text_response, token_usage
-
-    def create_api_specific_request_online(self, generic_request: GenericRequest) -> dict:
-        """Create a model-specific request from a generic request for online inference.
-        
-        Args:
-            generic_request: The generic request to convert
-            
-        Returns:
-            Dict containing the model-specific request
-            
-        Raises:
-            ValueError: If model provider is not supported
-        """
-        # Handle multimodal prompts
-        generic_request = self._unpack_multimodal(generic_request)
-        
-        # Check if we should use the Converse API for this model
-        if self._supports_converse_api():
-            return self._format_converse_request(generic_request)
-        
-        # Fall back to provider-specific formatting for invoke_model API
-        if self.model_provider == "anthropic":
-            return self._format_anthropic_request(generic_request)
-        elif self.model_provider == "amazon":
-            return self._format_amazon_request(generic_request)
-        elif self.model_provider == "meta":
-            return self._format_meta_request(generic_request)
-        elif self.model_provider == "cohere":
-            return self._format_cohere_request(generic_request)
-        elif self.model_provider == "ai21":
-            return self._format_ai21_request(generic_request)
-        elif self.model_provider == "mistral":
-            return self._format_mistral_request(generic_request)
-        else:
-            raise ValueError(f"Unsupported model provider: {self.model_provider}")
-
-    async def call_single_request(
-        self,
-        request: APIRequest,
-        session: aiohttp.ClientSession,
-        status_tracker: OnlineStatusTracker,
-    ) -> GenericResponse:
-        """Call a single API request.
-        
-        Args:
-            request: The API request to make
-            session: The aiohttp session to use
-            status_tracker: Status tracker to update
-            
-        Returns:
-            GenericResponse containing the model's response
-            
-        Raises:
-            Exception: If the request fails
-        """
-        start_time = datetime.datetime.now()
-        api_request = json.dumps(request.api_specific_request)
-        
-        try:
-            # Determine if we should use the Converse API
-            use_converse = self._supports_converse_api()
-            
-            if use_converse:
-                # Call Bedrock Converse API
-                response = await asyncio.to_thread(
-                    self.bedrock_runtime.converse,
-                    modelId=self.model_id,
-                    body=api_request,
-                    contentType="application/json",
-                    accept="application/json",
-                )
-                
-                # Process the response body
-                response_body = json.loads(response.get("body").read().decode("utf-8"))
-                
-                # Extract response from the converse format
-                text_response, token_usage = self._extract_converse_response(response_body)
-            else:
-                # Call standard Bedrock invoke_model API
-                response = await asyncio.to_thread(
-                    self.bedrock_runtime.invoke_model,
-                    modelId=self.model_id,
-                    body=api_request,
-                    contentType="application/json",
-                    accept="application/json",
-                )
-                
-                # Process the response body
-                response_body = json.loads(response.get("body").read().decode("utf-8"))
-                
-                # Extract response based on model provider
-                text_response, token_usage = self._extract_response_by_provider(response_body, request)
-            
-            # Calculate processing time
-            processing_time = (datetime.datetime.now() - start_time).total_seconds()
-            
-            # Create generic response
-            generic_response = GenericResponse(
-                task_id=request.task_id,
-                response=text_response,
-                success=True,
-                finish_reason="stop",
-                message="Success",
-                processing_time=processing_time,
-                completion_time=processing_time,
-                raw_data=response_body,
-                token_usage=token_usage
-            )
-            
-            # Update token usage in status tracker
-            status_tracker.update_token_usage("processed", token_usage)
-            
-            # Add token count to the moving window
-            self._add_output_token_moving_window(token_usage.output_tokens)
-            
-            return generic_response
-            
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "Unknown")
-            error_message = e.response.get("Error", {}).get("Message", str(e))
-            
-            # Map error codes to appropriate handling
-            if error_code in ["ThrottlingException", "ServiceQuotaExceededException"]:
-                # Rate limiting errors
-                logger.warning(f"Rate limit reached: {error_message}")
-                raise Exception(f"Rate limit reached: {error_message}")
-            else:
-                # Other client errors
-                logger.error(f"Bedrock API error: {error_code} - {error_message}")
-                raise Exception(f"Bedrock API error: {error_code} - {error_message}")
-        except Exception as e:
-            # Unexpected errors
-            logger.error(f"Unexpected error calling Bedrock: {str(e)}")
-            raise Exception(f"Unexpected error: {str(e)}")
-
-    def _extract_response_by_provider(self, response_body: dict, request: APIRequest) -> t.Tuple[str, _TokenUsage]:
-        """Extract text response and token usage from the response body based on model provider.
-        
-        Args:
-            response_body: The raw response body from the API
-            request: Original request for context
-            
-        Returns:
-            Tuple of (text_response, token_usage)
-            
-        Raises:
-            ValueError: If response format is not recognized
-        """
-        # Default values
-        text_response = ""
-        input_tokens = 0
-        output_tokens = 0
-        
-        # Extract based on model provider
-        if self.model_provider == "anthropic":
-            # Claude models
-            if "content" in response_body:
-                for content_item in response_body.get("content", []):
-                    if content_item.get("type") == "text":
-                        text_response = content_item.get("text", "")
-            
-            # Get token usage
-            usage = response_body.get("usage", {})
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
-            
-        elif self.model_provider == "amazon":
-            # Amazon Titan models
-            if "embed" in self.model_id.lower():
-                # Embedding response doesn't have text output
-                text_response = str(response_body.get("embedding", []))
-                input_tokens = response_body.get("inputTextTokenCount", 0)
-                output_tokens = 0
-            else:
-                # Text generation model
-                text_response = response_body.get("results", [{}])[0].get("outputText", "")
-                input_tokens = response_body.get("inputTextTokenCount", 0)
-                output_tokens = response_body.get("results", [{}])[0].get("tokenCount", 0)
-                
-        elif self.model_provider == "meta":
-            # Meta Llama models
-            text_response = response_body.get("generation", "")
-            input_tokens = response_body.get("prompt_token_count", 0)
-            output_tokens = response_body.get("generation_token_count", 0)
-            
-        elif self.model_provider == "cohere":
-            # Cohere models
-            if "embed" in self.model_id.lower():
-                # Embedding response
-                text_response = str(response_body.get("embeddings", [[]])[0])
-                input_tokens = len(response_body.get("texts", [""])[0]) // 4  # Rough estimate
-                output_tokens = 0
-            elif "command-r" in self.model_id.lower():
-                # Command R format
-                text_response = response_body.get("text", "")
-                token_count = response_body.get("token_count", {})
-                input_tokens = token_count.get("prompt_tokens", 0)
-                output_tokens = token_count.get("completion_tokens", 0)
-            else:
-                # Command format
-                text_response = response_body.get("generations", [{}])[0].get("text", "")
-                # Rough token estimate as Cohere doesn't always provide token counts
-                input_tokens = len(str(request.api_specific_request.get("prompt", ""))) // 4
-                output_tokens = len(text_response) // 4
-                
-        elif self.model_provider == "ai21":
-            # AI21 models
-            if "jamba" in self.model_id.lower():
-                # Jamba format
-                text_response = response_body.get("message", {}).get("content", "")
-                input_tokens = response_body.get("prompt_tokens", 0)
-                output_tokens = response_body.get("completion_tokens", 0)
-            else:
-                # Jurassic format
-                text_response = response_body.get("completions", [{}])[0].get("data", {}).get("text", "")
-                # AI21 doesn't provide token counts directly for Jurassic
-                input_tokens = len(str(request.api_specific_request.get("prompt", ""))) // 4
-                output_tokens = len(text_response) // 4
-                
-        elif self.model_provider == "mistral":
-            # Mistral AI models
-            choices = response_body.get("choices", [{}])
-            if choices:
-                message = choices[0].get("message", {})
-                text_response = message.get("content", "")
-            
-            # Get token usage
-            usage = response_body.get("usage", {})
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
-            
-        else:
-            raise ValueError(f"Unsupported model provider: {self.model_provider}")
+        # Get usage information - this is at the top level of the response, not in output
+        if "usage" in response_body:
+            usage = response_body["usage"]
+            # Field names follow camelCase convention in Bedrock API
+            input_tokens = usage.get("inputTokens", 0)
+            output_tokens = usage.get("outputTokens", 0)
+            total_tokens = usage.get("totalTokens", 0)
         
         # Create token usage object
         token_usage = _TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
@@ -1003,9 +603,6 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             True if the model supports the Converse API, False otherwise
         """
-        if not self.use_converse_api:
-            return False
-            
         # Check if using inference profile
         if self.model_id.startswith("us."):
             # Strip "us." prefix to check against the list
@@ -1023,4 +620,269 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             if model_base == supported_base or model_base in supported_model:
                 return True
                 
-        return False 
+        return False
+
+    def create_api_specific_request_online(self, generic_request: GenericRequest) -> dict:
+        """Create a model-specific request from a generic request for online inference.
+        
+        Args:
+            generic_request: The generic request to convert
+            
+        Returns:
+            Dict containing the model-specific request
+            
+        Raises:
+            ValueError: If model provider is not supported
+        """
+        # Handle multimodal prompts
+        generic_request = self._unpack_multimodal(generic_request)
+        
+        # Always try to use the Converse API first for supported models
+        # as it provides better chat capabilities and consistent interface
+        if self._supports_converse_api():
+            try:
+                return self._format_converse_request(generic_request)
+            except Exception as e:
+                logger.warning(f"Failed to format request for Converse API, falling back to provider-specific format: {str(e)}")
+        
+        # Fall back to provider-specific formatting if Converse API is not supported or formatting failed
+        if self.model_provider == "anthropic":
+            return self._format_anthropic_request(generic_request)
+        elif self.model_provider == "amazon":
+            return self._format_amazon_request(generic_request)
+        elif self.model_provider == "meta":
+            return self._format_meta_request(generic_request)
+        elif self.model_provider == "cohere":
+            return self._format_cohere_request(generic_request)
+        elif self.model_provider == "ai21":
+            return self._format_ai21_request(generic_request)
+        elif self.model_provider == "mistral":
+            return self._format_mistral_request(generic_request)
+        else:
+            raise ValueError(f"Unsupported model provider: {self.model_provider}")
+
+    def _process_response(self, generic_response: GenericResponse) -> list:
+        """Process a generic response into a format expected by the parser.
+        
+        Args:
+            generic_response: The generic response to process
+            
+        Returns:
+            List of processed responses in the expected format
+        """
+        # Ensure we have a valid response object
+        if not generic_response:
+            return []
+        
+        # Try to get text from the response object
+        text = ""
+        if hasattr(generic_response, 'text'):
+            text = generic_response.text
+        # If text is not directly available, try to extract it from raw_response
+        elif hasattr(generic_response, 'raw_response'):
+            raw_response = generic_response.raw_response
+            # Check if this is a Converse API response
+            if "output" in raw_response and "message" in raw_response["output"]:
+                # Extract text from Converse API response
+                message = raw_response["output"]["message"]
+                if "content" in message:
+                    content_items = message["content"]
+                    text_parts = []
+                    for item in content_items:
+                        if "text" in item:
+                            text_parts.append(item["text"])
+                    text = "\n".join(text_parts)
+            # Otherwise extract text based on model provider
+            elif self.model_provider == "anthropic":
+                text = raw_response.get("content", [{}])[0].get("text", "")
+            elif self.model_provider == "amazon":
+                text = raw_response.get("outputText", "")
+            elif self.model_provider == "meta":
+                text = raw_response.get("generation", "")
+            elif self.model_provider == "cohere":
+                text = raw_response.get("generations", [{}])[0].get("text", "")
+            elif self.model_provider == "ai21":
+                text = raw_response.get("completions", [{}])[0].get("data", {}).get("text", "")
+            elif self.model_provider == "mistral":
+                text = raw_response.get("outputs", [{}])[0].get("text", "")
+            
+        # Create a properly formatted response dictionary
+        return [{"response": text}]
+        
+    def generate(self, prompt: str | list) -> dict:
+        """Generate a response for a single prompt.
+
+        Args:
+            prompt: The prompt to send to the model (string or list of messages)
+
+        Returns:
+            A dictionary containing the model's response with 'response' as the key
+        """
+        # Set up default prompt formatter if not already set
+        if not hasattr(self, 'prompt_formatter'):
+            def default_prompt_func(row):
+                if isinstance(row, str):
+                    return row
+                return row.get("prompt", "")
+
+            self.prompt_formatter = PromptFormatter(
+                model_name=self.model_id,
+                prompt_func=default_prompt_func
+            )
+
+        # Create a generic request
+        generic_request = GenericRequest(
+            model=self.model_id,
+            messages=[{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt,
+            generation_params=self.config.generation_params or {},
+            original_row={"prompt": prompt},  # Store the original prompt
+            original_row_idx=0  # Single request always has index 0
+        )
+
+        # Create API request
+        request = APIRequest(
+            task_id=0,
+            generic_request=generic_request,
+            api_specific_request=self.create_api_specific_request_online(generic_request),
+            attempts_left=self.config.max_retries,
+            prompt_formatter=self.prompt_formatter
+        )
+
+        # Make the request
+        response = run_in_event_loop(
+            self.call_single_request(
+                request=request,
+                session=aiohttp.ClientSession(),
+                status_tracker=OnlineStatusTracker(
+                    token_limit_strategy=self.token_limit_strategy,
+                    max_requests_per_minute=self.max_requests_per_minute,
+                    max_tokens_per_minute=self.max_tokens_per_minute,
+                    compatible_provider=self.compatible_provider
+                )
+            )
+        )
+
+        # Process the response to extract the text
+        processed_responses = self._process_response(response)
+        
+        # Return the processed response suitable for the LLM class
+        if processed_responses:
+            return processed_responses[0]
+        else:
+            # Fallback if no processed responses
+            logger.warning("No processed responses available, returning empty response")
+            if hasattr(response, 'raw_response'):
+                logger.debug(f"Raw response: {response.raw_response}")
+            return {"response": ""}
+
+    async def call_single_request(
+        self,
+        request: APIRequest,
+        session: aiohttp.ClientSession,
+        status_tracker: OnlineStatusTracker,
+    ) -> GenericResponse:
+        """Make a single API request to AWS Bedrock.
+        
+        Args:
+            request: The API request to make
+            
+        Returns:
+            GenericResponse containing the model's response
+            
+        Raises:
+            Exception: If the API call fails
+        """
+        try:
+            # Get the request body
+            request_body = request.api_specific_request
+
+            # Determine which API to use
+            if self._supports_converse_api():
+                # Use Converse API
+                # Prepare parameters for converse API
+                params = {
+                    "modelId": self.model_id,
+                    "messages": request_body["messages"]
+                }
+                
+                # Add system message if present, formatted as a list of dictionaries with text field
+                if request_body.get("system"):
+                    params["system"] = [{"text": request_body["system"]}]
+                    
+                # Add inference config if present
+                if request_body.get("inferenceConfig"):
+                    params["inferenceConfig"] = {
+                        "temperature": request_body["inferenceConfig"].get("temperature"),
+                        "topP": request_body["inferenceConfig"].get("topP"),
+                        "maxTokens": request_body["inferenceConfig"].get("maxTokens"),
+                        "stopSequences": request_body["inferenceConfig"].get("stopSequences")
+                    }
+                
+                response = self.bedrock_runtime.converse(**params)
+                response_body = response
+                text_response, token_usage = self._extract_converse_response(response_body)
+            else:
+                # Use provider-specific API
+                response = self.bedrock_runtime.invoke_model(
+                    modelId=self.model_id,
+                    body=json.dumps(request_body).encode()
+                )
+                response_body = json.loads(response["body"].read())
+                
+                # Extract response based on provider
+                if self.model_provider == "anthropic":
+                    text_response = response_body.get("content", [{}])[0].get("text", "")
+                    token_usage = _TokenUsage(
+                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
+                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    )
+                elif self.model_provider == "amazon":
+                    text_response = response_body.get("outputText", "")
+                    token_usage = _TokenUsage(
+                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
+                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    )
+                elif self.model_provider == "meta":
+                    text_response = response_body.get("generation", "")
+                    token_usage = _TokenUsage(
+                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
+                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    )
+                elif self.model_provider == "cohere":
+                    text_response = response_body.get("generations", [{}])[0].get("text", "")
+                    token_usage = _TokenUsage(
+                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
+                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    )
+                elif self.model_provider == "ai21":
+                    text_response = response_body.get("completions", [{}])[0].get("data", {}).get("text", "")
+                    token_usage = _TokenUsage(
+                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
+                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    )
+                elif self.model_provider == "mistral":
+                    text_response = response_body.get("outputs", [{}])[0].get("text", "")
+                    token_usage = _TokenUsage(
+                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
+                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    )
+                else:
+                    raise ValueError(f"Unsupported model provider: {self.model_provider}")
+            
+            # Get current time for timestamps
+            current_time = datetime.datetime.now(datetime.UTC)
+            
+            # Create and return the response
+            return GenericResponse(
+                text=text_response,
+                token_usage=token_usage,
+                raw_response=response_body,
+                generic_request=request.generic_request,
+                created_at=current_time,
+                finished_at=current_time,
+                original_response=response_body
+            )
+            
+        except Exception as e:
+            logger.error(f"Error making API request: {str(e)}")
+            raise
