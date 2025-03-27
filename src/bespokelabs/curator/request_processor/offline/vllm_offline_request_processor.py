@@ -138,7 +138,6 @@ class VLLMOfflineRequestProcessor(BaseOfflineRequestProcessor):
         """Destroy the VLLM model and cleanup the environment."""
         destroy_model_parallel()
         destroy_distributed_environment()
-        del self.model_class.llm_engine.model_executor
         del self.model_class
         with contextlib.suppress(AssertionError):
             torch.distributed.destroy_process_group()
