@@ -136,14 +136,29 @@ class VLLMOfflineRequestProcessor(BaseOfflineRequestProcessor):
 
     def destroy(self):
         """Destroy the VLLM model and cleanup the environment."""
-        destroy_model_parallel()
-        destroy_distributed_environment()
-        del self.model_class
-        with contextlib.suppress(AssertionError):
-            torch.distributed.destroy_process_group()
+        try:
+            if hasattr(self, 'model_class'):
+                destroy_model_parallel()
+                destroy_distributed_environment()
+                del self.model_class
+        except Exception as e:
+            logger.warning(f"Error during vLLM model cleanup: {e}")
+        
+        # Use contextlib.suppress to ignore any errors during cleanup
+        with contextlib.suppress(Exception):
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+        
+        # Force garbage collection
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+        logger.info("vLLM resources cleaned up")
 
     def fix_json(self, response_message: str) -> str:
         """Fix incomplete JSON responses from vLLM guided decoding.
@@ -173,6 +188,15 @@ class VLLMOfflineRequestProcessor(BaseOfflineRequestProcessor):
             list[GenericResponse]: List of generic responses
         """
         guided_decoding_params = None
+        
+        # Check if requests list is empty to avoid IndexError
+        if not requests:
+            logger.warning("Empty requests list received. Returning empty response list.")
+            status_tracker.time_finished = datetime.datetime.now()
+            status_tracker.finished_successfully = True
+            status_tracker.num_total_requests = 0
+            return []
+            
         response_format = requests[0].generic_request.response_format
         if response_format is not None and self.support_structured_output:
             guided_decoding_params = GuidedDecodingParams(json=response_format)
@@ -189,36 +213,40 @@ class VLLMOfflineRequestProcessor(BaseOfflineRequestProcessor):
 
         formatted_prompts = self.format_prompts([request.generic_request.messages for request in requests])
 
-        completions = self.model_class.generate(
-            formatted_prompts,
-            sampling_params=vllm.SamplingParams(**sampling_params),
-        )
-        status_tracker.time_finished = datetime.datetime.now()
-        status_tracker.finished_successfully = True
-        status_tracker.num_total_requests = len(requests)
-        self.destroy()
-
-        responses = []
-
-        for completion, request in zip(completions, requests):
-            response_message = completion.outputs[0].text
-            if response_format is not None and self.support_structured_output:
-                response_message = self.fix_json(response_message)
-
-            raw_response = {
-                "request_id": completion.request_id,
-                "finished": completion.finished,
-                "encoder_prompt": completion.encoder_prompt,
-                "prompt": completion.prompt,
-                "metrics": completion.metrics,
-            }
-            response = GenericResponse(
-                model=self.model,
-                response_message=response_message,
-                raw_response=raw_response,
-                created_at=status_tracker.time_started,
-                finished_at=status_tracker.time_finished,
-                generic_request=request.generic_request,
+        # Wrap in try-finally to ensure cleanup even if an error occurs during generation
+        try:
+            completions = self.model_class.generate(
+                formatted_prompts,
+                sampling_params=vllm.SamplingParams(**sampling_params),
             )
-            responses.append(response)
-        return responses
+            status_tracker.time_finished = datetime.datetime.now()
+            status_tracker.finished_successfully = True
+            status_tracker.num_total_requests = len(requests)
+
+            responses = []
+
+            for completion, request in zip(completions, requests):
+                response_message = completion.outputs[0].text
+                if response_format is not None and self.support_structured_output:
+                    response_message = self.fix_json(response_message)
+
+                raw_response = {
+                    "request_id": completion.request_id,
+                    "finished": completion.finished,
+                    "encoder_prompt": completion.encoder_prompt,
+                    "prompt": completion.prompt,
+                    "metrics": completion.metrics,
+                }
+                response = GenericResponse(
+                    model=self.model,
+                    response_message=response_message,
+                    raw_response=raw_response,
+                    created_at=status_tracker.time_started,
+                    finished_at=status_tracker.time_finished,
+                    generic_request=request.generic_request,
+                )
+                responses.append(response)
+            return responses
+        finally:
+            # Always clean up GPU memory, even if an error occurs
+            self.destroy()
