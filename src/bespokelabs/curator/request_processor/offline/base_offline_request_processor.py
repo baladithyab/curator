@@ -180,6 +180,7 @@ class BaseOfflineRequestProcessor(BaseRequestProcessor, ABC):
 
         # Save responses
         with open(save_filepath, "a") as f:
+            num_newly_parsed = 0
             for response in responses:
                 processed_response = self._process_response(response)
                 response.parsed_response_message = processed_response
@@ -187,9 +188,14 @@ class BaseOfflineRequestProcessor(BaseRequestProcessor, ABC):
                 f.write(json_string + "\n")
 
                 # Stream responses to viewer client
-                idx = status_tracker.num_parsed_responses
-                status_tracker.num_parsed_responses = idx + len(responses)
+                idx = status_tracker.num_parsed_responses + num_newly_parsed
+                # Increment count based on how many items were actually parsed from this response
+                num_parsed_from_current = len(processed_response) if isinstance(processed_response, list) else 1 if processed_response else 0
+                num_newly_parsed += num_parsed_from_current
                 run_in_event_loop(self.viewer_client.stream_response(json_string, idx))
+
+            # Update the tracker after the loop finishes processing the batch
+            status_tracker.num_parsed_responses += num_newly_parsed
 
         # Log final status
         logger.info(f"Processing complete. Results saved to {save_filepath}")
