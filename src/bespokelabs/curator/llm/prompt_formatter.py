@@ -126,27 +126,16 @@ class PromptFormatter:
             generation_params=row_generation_params,
         )
 
-    def response_to_response_format(self, response_message: str | dict) -> Optional[dict | str]:
-        """Converts a response message to a specified Pydantic model format.
-
-        This method takes a response message (either as a string or dict) and validates/converts it
-        according to the provided Pydantic model format. If the response message is a string,
-        it first attempts to parse it as JSON. The resulting dict is then used to construct
-        an instance of the specified Pydantic model.
+    def response_to_response_format(self, response_message: Any) -> T | None:
+        """Parse the response message according to the response format.
 
         Args:
-            response_message: The response message to convert, either as a JSON string
-                or a dictionary.
+            response_message: The response message from the model
 
         Returns:
-            The validated response message as a Pydantic model instance.
-
-        Raises:
-            json.JSONDecodeError: If the response_message is a string but cannot be parsed as valid JSON.
-            ValidationError: If the parsed response does not match the schema defined by response_format.
+            The parsed response message or None if parsing fails
         """
-        # Response message is a string, which is converted to a dict
-        # The dict is then used to construct the response_format Pydantic model
+        logger.info(f"!!! PROMPT FORMATTER received: '{response_message}' (type: {type(response_message)})") # Log received value
         if self.response_format is None:
             return response_message
 

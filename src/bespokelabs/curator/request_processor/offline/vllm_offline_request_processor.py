@@ -227,7 +227,7 @@ class VLLMOfflineRequestProcessor(BaseOfflineRequestProcessor):
 
             for completion, request in zip(completions, requests):
                 response_message = completion.outputs[0].text
-                logger.debug(f"vLLM raw output text for request {completion.request_id}: '{response_message}'")
+                logger.info(f"!!! VLLM RAW OUTPUT for Request ID {completion.request_id}: '{response_message}'")
                 if response_format is not None and self.support_structured_output:
                     response_message = self.fix_json(response_message)
 
