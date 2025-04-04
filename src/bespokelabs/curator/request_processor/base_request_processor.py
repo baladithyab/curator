@@ -417,8 +417,13 @@ class BaseRequestProcessor(ABC):
                         # TODO: Find a way to not process responses that have already been processed
                         # We cannot just check if parsed_response_message is not None because it could be from cached previous run
                         # response.
-                        response.parsed_response_message = self._process_response(response)
+                        # response.parsed_response_message = self._process_response(response) <-- REMOVE THIS REDUNDANT CALL
+
+                        # Directly use the parsed_response_message loaded from the file
                         if response.parsed_response_message is None:
+                            # This case might occur if the *first* parsing attempt failed and saved None,
+                            # or if the field was missing in the saved JSONL for some reason.
+                            logger.warning(f"Skipping response {response.generic_request.original_row_idx} because parsed_response_message is None in the saved file.")
                             failed_responses_count += 1
                             continue
 
