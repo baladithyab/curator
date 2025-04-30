@@ -1,113 +1,130 @@
-# AWS Bedrock Tests
+# AWS Bedrock Integration
 
-This directory contains test scripts for the AWS Bedrock integration in the Curator project.
+This directory contains comprehensive examples for the AWS Bedrock integration in the Curator project.
 
-## Test Scripts
+## Examples
 
-- `test_bedrock_batch_simple.py`: Simple tests for the Bedrock batch processor that don't require AWS credentials
-- `test_bedrock_batch.py`: Tests for the Bedrock batch processor
-- `test_bedrock_batch_processor.py`: More comprehensive tests for the Bedrock batch processor
-- `test_bedrock_implementation.py`: Tests for the Bedrock implementation
-- `test_bedrock_online.py`: Tests for the Bedrock online processor
+- `bedrock_online_examples.py`: Demonstrates how to use Curator with AWS Bedrock for online inference with various models (Claude 3.5 v2, Llama 3.3, Nova Pro, etc.)
+- `bedrock_batch_examples.py`: Demonstrates how to use Curator with AWS Bedrock for batch processing with Claude 3.5 Haiku and Nova Micro
 
-## Running the Tests
+## Utility Scripts
+
+- `setup_bedrock_resources.py`: Helper script to create and manage AWS resources (S3 bucket, IAM role) needed for batch processing
+
+## Running the Examples
 
 ### Prerequisites
 
-To run the tests that make actual API calls, you need:
+To run the examples, you need:
 
-1. AWS credentials with access to Bedrock configured via AWS CLI
-2. Permissions to create S3 buckets and IAM roles (if not providing existing ones)
+1. AWS credentials with access to Bedrock
+2. Access to the models used in the examples
+3. For batch examples, an S3 bucket and IAM role with appropriate permissions
 
-The test runner will automatically:
-- Use the AWS region from your AWS CLI configuration
-- Create an S3 bucket and IAM role if they don't exist
-- Clean up resources after the tests (unless you specify otherwise)
+### Setting Up AWS Credentials
 
-### Running All Tests
+You can set up AWS credentials in several ways:
 
-To run all tests with automatic resource creation and cleanup:
+1. Environment variables:
+   ```bash
+   export AWS_ACCESS_KEY_ID=your_access_key
+   export AWS_SECRET_ACCESS_KEY=your_secret_key
+   export AWS_REGION=us-east-1
+   ```
 
-```bash
-python run_all_tests.py
-```
+2. AWS credentials file (`~/.aws/credentials`):
+   ```
+   [default]
+   aws_access_key_id = your_access_key
+   aws_secret_access_key = your_secret_key
+   ```
 
-### Command Line Options
+3. AWS config file (`~/.aws/config`):
+   ```
+   [default]
+   region = us-east-1
+   ```
 
-The test runner supports several command line options:
-
-```bash
-# Run only simple tests that don't require AWS credentials
-python run_all_tests.py --simple-only
-
-# Enable verbose output (shows detailed test results)
-python run_all_tests.py --verbose
-
-# Keep AWS resources after tests
-python run_all_tests.py --keep-resources
-
-# Download test results before cleanup
-python run_all_tests.py --download-results
-
-# Specify a download directory
-python run_all_tests.py --download-results --download-dir my_results
-
-# Specify an existing S3 bucket to use
-python run_all_tests.py --bucket-name my-existing-bucket
-
-# Specify an existing IAM role name to use
-python run_all_tests.py --role-name MyExistingRole
-
-# Specify an AWS profile to use
-python run_all_tests.py --profile my-profile
-
-# Specify an AWS region to use
-python run_all_tests.py --region us-west-2
-
-# Combine options as needed
-python run_all_tests.py --simple-only --verbose
-```
-
-The test runner will automatically detect and use AWS credentials in the following order of priority:
-1. AWS CLI configuration (default profile or specified profile)
-2. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc.)
-3. EC2 instance profile (if running on EC2)
-
-### Setting Up Environment Variables Manually (Optional)
-
-If you prefer to set up environment variables manually:
+### Running the Online Examples
 
 ```bash
-# Edit the setup_env.sh script to set your AWS credentials and S3 bucket
-nano setup_env.sh
+# Run all examples with Claude 3.5 Sonnet v2
+python bedrock_online_examples.py --model anthropic.claude-3-5-sonnet-20241022-v2:0 --region us-west-2
 
-# Source the environment variables
-source setup_env.sh
+# Run a specific example
+python bedrock_online_examples.py --example simple --region us-west-2
+
+# Run the model comparison example
+python bedrock_online_examples.py --example comparison --region us-west-2
 ```
 
-### Running Individual Tests
+### Running the Batch Examples
 
-To run a specific test:
+First, you need to set up the required AWS resources (S3 bucket and IAM role):
 
 ```bash
-python test_bedrock_batch_simple.py
+# Create the necessary AWS resources
+python setup_bedrock_resources.py --create
+
+# List existing resources
+python setup_bedrock_resources.py --list
 ```
 
-## Test Configuration
+Then run the batch examples:
 
-The tests use the following environment variables:
+```bash
+# Run all examples with automatically created resources
+python bedrock_batch_examples.py --create-resources --region us-west-2
 
-- `AWS_REGION`: AWS region to use for Bedrock API calls
+# Run with existing resources
+python bedrock_batch_examples.py --s3-bucket your-bucket --role-arn arn:aws:iam::123456789012:role/your-role --region us-west-2
+
+# Run a specific example
+python bedrock_batch_examples.py --example simple --s3-bucket your-bucket --role-arn arn:aws:iam::123456789012:role/your-role
+
+# Clean up resources after running
+python setup_bedrock_resources.py --destroy
+```
+
+## Environment Variables
+
+The examples use the following environment variables:
+
+- `AWS_REGION`: AWS region to use for Bedrock API calls (default: us-west-2)
+- `AWS_ACCESS_KEY_ID`: Your AWS access key ID
+- `AWS_SECRET_ACCESS_KEY`: Your AWS secret access key
+- `AWS_SESSION_TOKEN`: Your AWS session token (if using temporary credentials)
 - `BEDROCK_BATCH_S3_BUCKET`: S3 bucket to use for batch input/output
 - `BEDROCK_BATCH_ROLE_ARN`: IAM role ARN with permissions for Bedrock batch jobs
-- `CURATOR_DISABLE_CACHE`: Set to "1" to disable caching for tests
 - `CURATOR_LOG_LEVEL`: Set to "DEBUG" for more verbose logging output
-- `BEDROCK_TEST_VERBOSE`: Set to "1" to enable verbose test output (same as using --verbose flag)
 
-## Models Tested
+## Models Used
 
-The tests cover the following AWS Bedrock models:
+The examples cover the following AWS Bedrock models:
 
-- Claude 3.5 Sonnet
-- Amazon Nova
-- Meta Llama 3
+- Claude 3.5 Sonnet v2 (`anthropic.claude-3-5-sonnet-20241022-v2:0`)
+- Claude 3.5 Haiku (`anthropic.claude-3-5-haiku-20241022-v1:0`)
+- Llama 3.3 70B (`meta.llama3-3-70b-instruct-v1:0`)
+- Amazon Nova Pro (`amazon.nova-pro-v1:0`)
+- Amazon Nova Micro (`amazon.nova-micro-v1:0`)
+- Mistral Large (`mistral.mistral-large-2407-v1:0`)
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Missing AWS Credentials**: Ensure that your AWS credentials are properly set up and have access to Bedrock.
+
+2. **Model Access**: Make sure you have access to the models you're trying to use. You can check this in the AWS Bedrock console.
+
+3. **S3 Bucket Permissions**: For batch processing, ensure that your IAM role has the necessary permissions to access the S3 bucket.
+
+4. **Region Compatibility**: Make sure you're using a region where Bedrock is available and your models are accessible.
+
+### Getting Help
+
+If you encounter issues with the Bedrock integration, check the following resources:
+
+- [AWS Bedrock Documentation](https://docs.aws.amazon.com/bedrock/)
+- [Curator Documentation](https://curator.readthedocs.io/)
+- [AWS Bedrock Forum](https://forums.aws.amazon.com/)

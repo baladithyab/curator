@@ -9,12 +9,15 @@ import datetime
 import json
 import os
 import re
+import time
 import typing as t
 from io import BytesIO
 from pathlib import Path
 
 import aiohttp
+import aioboto3
 import boto3
+import botocore.config
 from botocore.exceptions import ClientError
 
 from bespokelabs.curator.llm.prompt_formatter import PromptFormatter
@@ -29,6 +32,14 @@ from bespokelabs.curator.status_tracker.online_status_tracker import OnlineStatu
 from bespokelabs.curator.types.generic_request import GenericRequest
 from bespokelabs.curator.types.generic_response import GenericResponse
 from bespokelabs.curator.types.token_usage import _TokenUsage
+
+# Import CloudWatch metrics integration
+try:
+    import boto3.session
+    from botocore.exceptions import NoCredentialsError
+    HAS_CLOUDWATCH = True
+except ImportError:
+    HAS_CLOUDWATCH = False
 
 
 class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
@@ -106,15 +117,42 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         config: OnlineRequestProcessorConfig,
         region_name: str = None,
         use_inference_profile: bool = False,
+        boto_config: dict = None,
+        enable_metrics: bool = False,
     ):
-        """Initialize the BedrockOnlineRequestProcessor."""
+        """Initialize the BedrockOnlineRequestProcessor.
+        
+        Args:
+            config: Configuration for the request processor
+            region_name: AWS region to use for Bedrock API calls
+            use_inference_profile: Whether to use inference profiles instead of direct model IDs
+            boto_config: Additional boto3 configuration options
+            enable_metrics: Whether to enable CloudWatch metrics
+        """
         super().__init__(config)
 
-        # Initialize AWS Bedrock client
+        # Initialize shared boto3 session for client reuse
         self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
-        self.bedrock_runtime = boto3.client('bedrock-runtime', region_name=self.region_name)
-        self.bedrock = boto3.client('bedrock', region_name=self.region_name)
-
+        self.session = boto3.session.Session(region_name=self.region_name)
+        
+        # Configure boto3 with performance optimizations
+        self.boto_config = boto_config or {}
+        default_config = {
+            'retries': {'max_attempts': 3, 'mode': 'standard'},
+            'connect_timeout': 5,
+            'read_timeout': 60,
+        }
+        self.boto_config = {**default_config, **self.boto_config}
+        
+        # Create boto3 clients with shared session and config
+        boto_config_obj = botocore.config.Config(**self.boto_config)
+        self.bedrock_runtime = self.session.client('bedrock-runtime', config=boto_config_obj)
+        self.bedrock = self.session.client('bedrock', config=boto_config_obj)
+        
+        # Initialize async clients
+        self.async_session = None
+        self.async_bedrock_runtime = None
+        
         # Store model ID and determine provider
         self.model_id = config.model
         self.use_inference_profile = use_inference_profile
@@ -127,6 +165,25 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
         # Provider-specific settings
         self.max_image_size_mb = self._get_max_image_size()
+        
+        # Metrics configuration
+        self.enable_metrics = enable_metrics and HAS_CLOUDWATCH
+        self.metrics_namespace = "BespokeLabs/Curator/Bedrock"
+        self.cloudwatch_client = None
+        if self.enable_metrics:
+            try:
+                self.cloudwatch_client = self.session.client('cloudwatch')
+                logger.info("CloudWatch metrics integration enabled")
+            except (ClientError, NoCredentialsError) as e:
+                logger.warning(f"Failed to initialize CloudWatch client: {str(e)}")
+                self.enable_metrics = False
+        
+        # Request tracking for metrics
+        self.request_start_times = {}
+        
+        # Initialize token count tracking for better estimation
+        self.token_count_history = []
+        self.max_token_history = 100
 
         logger.info(f"Initialized AWS Bedrock processor for model {self.model_id} "
                    f"({self.model_provider}) in region {self.region_name}")
@@ -261,6 +318,23 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                 f"Image size {size_mb:.2f}MB exceeds {self.model_provider} limit of {self.max_image_size_mb}MB"
             )
 
+    async def initialize_async_clients(self):
+        """Initialize async boto3 clients for better performance.
+        
+        This method creates async clients that can be used for concurrent API calls.
+        """
+        if self.async_session is None:
+            self.async_session = aioboto3.Session(region_name=self.region_name)
+            
+        # Create async bedrock runtime client if not already initialized
+        if self.async_bedrock_runtime is None:
+            self.async_bedrock_runtime = await self.async_session.client(
+                'bedrock-runtime',
+                config=botocore.config.Config(**self.boto_config)
+            ).__aenter__()
+            
+            logger.info(f"Initialized async boto3 clients for region {self.region_name}")
+    
     def estimate_total_tokens(self, messages: list) -> _TokenUsage:
         """Estimate token usage for the given messages.
 
@@ -270,31 +344,82 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Returns:
             TokenUsage object with input and output token estimates
         """
-        # This is a simplistic estimate - for accuracy, we'd need to use model-specific tokenizers
+        # Improved token estimation with model-specific adjustments
         total_text = ""
-
+        
+        # Count role overhead tokens based on model provider
+        role_overhead = 0
+        message_count = 0
+        has_system_message = False
+        
         if isinstance(messages, list):
+            message_count = len(messages)
             for message in messages:
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
+                if isinstance(message, dict):
+                    # Add role overhead
+                    role = message.get("role", "user").lower()
+                    if role == "system":
+                        has_system_message = True
+                        role_overhead += 9  # Approximate overhead for system message
+                    elif role == "user":
+                        role_overhead += 4  # Approximate overhead for user message
+                    elif role == "assistant":
+                        role_overhead += 6  # Approximate overhead for assistant message
+                    
+                    # Process content
+                    content = message.get("content", "")
                     if isinstance(content, list):
                         for item in content:
-                            if isinstance(item, dict) and "text" in item:
-                                total_text += item["text"]
+                            if isinstance(item, dict):
+                                # Handle multimodal content
+                                if "text" in item:
+                                    total_text += item["text"]
+                                elif "image" in item:
+                                    # Image tokens vary by model, using conservative estimate
+                                    if self.model_provider == "anthropic":
+                                        total_text += " " * 1024  # Claude models use ~1024 tokens per image
+                                    else:
+                                        total_text += " " * 512  # Conservative estimate for other models
                     elif isinstance(content, str):
                         total_text += content
                 elif isinstance(message, str):
                     total_text += message
         elif isinstance(messages, str):
             total_text = messages
-
-        # Rough estimate: 1 token ≈ 4 characters for English text
-        input_tokens = len(total_text) // 4
-
-        # Estimate output tokens - this will depend on the model and prompt
-        # A rough heuristic is that output is often similar in size to input for many cases
-        output_tokens = input_tokens
-
+        
+        # Model-specific token ratio adjustments
+        chars_per_token = 4.0  # Default for English text
+        if self.model_provider == "anthropic":
+            chars_per_token = 3.8  # Claude models have slightly different tokenization
+        elif self.model_provider == "meta":
+            chars_per_token = 3.7  # Llama models tokenization
+        elif self.model_provider == "mistral":
+            chars_per_token = 3.6  # Mistral models tokenization
+            
+        # Calculate input tokens with formatting overhead
+        format_overhead = 10  # Base overhead for request formatting
+        if has_system_message:
+            format_overhead += 5  # Additional overhead for system message
+            
+        # Calculate tokens from text length
+        text_tokens = int(len(total_text) / chars_per_token)
+        
+        # Total input tokens with all overhead
+        input_tokens = text_tokens + role_overhead + format_overhead
+        
+        # Estimate output tokens based on historical data if available
+        if self.token_count_history:
+            # Use moving average of past responses
+            output_tokens = sum(count for _, count in self.token_count_history) // len(self.token_count_history)
+        else:
+            # Fallback to heuristic based on input size and model behavior
+            if self.model_provider == "anthropic":
+                # Claude models tend to be more verbose
+                output_tokens = max(100, int(input_tokens * 1.2))
+            else:
+                # Other models tend to be more concise
+                output_tokens = max(50, int(input_tokens * 0.8))
+        
         return _TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
 
     def estimate_output_tokens(self) -> int:
@@ -622,6 +747,54 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
         return False
 
+    def _select_optimal_api(self, generic_request: GenericRequest) -> str:
+        """Select the optimal API based on request characteristics.
+        
+        Args:
+            generic_request: The generic request to analyze
+            
+        Returns:
+            String indicating which API to use: 'converse' or 'invoke_model'
+        """
+        # Check if model supports Converse API
+        if not self._supports_converse_api():
+            return 'invoke_model'
+            
+        # Check for multimodal content which is better handled by Converse API
+        has_multimodal = False
+        if isinstance(generic_request.messages, list):
+            for message in generic_request.messages:
+                if isinstance(message, dict) and isinstance(message.get("content"), list):
+                    for content_item in message["content"]:
+                        if isinstance(content_item, dict) and "image" in content_item:
+                            has_multimodal = True
+                            break
+        
+        if has_multimodal:
+            return 'converse'
+            
+        # Check for multi-turn conversation which is better with Converse API
+        if isinstance(generic_request.messages, list) and len(generic_request.messages) > 1:
+            return 'converse'
+            
+        # Check for system message which is better handled by Converse API
+        has_system = False
+        if isinstance(generic_request.messages, list):
+            for message in generic_request.messages:
+                if isinstance(message, dict) and message.get("role") == "system":
+                    has_system = True
+                    break
+        
+        if has_system:
+            return 'converse'
+            
+        # For simple text completion with no special requirements, invoke_model can be more efficient
+        if len(generic_request.messages) == 1 and self.model_provider not in ["anthropic", "meta", "mistral"]:
+            return 'invoke_model'
+            
+        # Default to Converse API for better compatibility
+        return 'converse'
+    
     def create_api_specific_request_online(self, generic_request: GenericRequest) -> dict:
         """Create a model-specific request from a generic request for online inference.
 
@@ -629,16 +802,60 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             generic_request: The generic request to convert
 
         Returns:
-            Dict containing the model-specific request formatted for the Converse API
+            Dict containing the model-specific request formatted for the appropriate API
         """
         # Handle multimodal prompts
         generic_request = self._unpack_multimodal(generic_request)
 
-        # Always use the Converse API for all models
+        # Select optimal API based on request characteristics
+        api_type = self._select_optimal_api(generic_request)
+        
+        # Log request details with structured logging
+        request_id = f"req_{int(time.time() * 1000)}"
+        self.request_start_times[request_id] = time.time()
+        
+        logger.info(
+            f"Processing request {request_id}",
+            extra={
+                "request_id": request_id,
+                "model_id": self.model_id,
+                "api_type": api_type,
+                "message_count": len(generic_request.messages) if isinstance(generic_request.messages, list) else 1,
+                "provider": self.model_provider,
+                "region": self.region_name
+            }
+        )
+        
+        # Format request based on selected API
         try:
-            return self._format_converse_request(generic_request)
+            if api_type == 'converse':
+                return self._format_converse_request(generic_request)
+            else:
+                # Use provider-specific formatting for invoke_model API
+                if self.model_provider == "anthropic":
+                    return self._format_anthropic_request(generic_request)
+                elif self.model_provider == "amazon":
+                    return self._format_amazon_request(generic_request)
+                elif self.model_provider == "meta":
+                    return self._format_meta_request(generic_request)
+                elif self.model_provider == "cohere":
+                    return self._format_cohere_request(generic_request)
+                elif self.model_provider == "ai21":
+                    return self._format_ai21_request(generic_request)
+                elif self.model_provider == "mistral":
+                    return self._format_mistral_request(generic_request)
+                else:
+                    # Default to Converse API if provider-specific format is not available
+                    return self._format_converse_request(generic_request)
         except Exception as e:
-            logger.error(f"Failed to format request for Converse API: {str(e)}")
+            logger.error(
+                f"Failed to format request: {str(e)}",
+                extra={
+                    "request_id": request_id,
+                    "error": str(e),
+                    "model_id": self.model_id
+                }
+            )
             raise
 
     def _process_response(self, generic_response: GenericResponse) -> list:
@@ -752,6 +969,8 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
         Args:
             request: The API request to make
+            session: The aiohttp client session
+            status_tracker: The status tracker for rate limiting
 
         Returns:
             GenericResponse containing the model's response
@@ -759,36 +978,111 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         Raises:
             Exception: If the API call fails
         """
+        # Generate a unique request ID for tracking
+        request_id = f"req_{int(time.time() * 1000)}"
+        start_time = time.time()
+        self.request_start_times[request_id] = start_time
+        
         try:
+            # Initialize async clients if needed
+            if self.async_bedrock_runtime is None:
+                await self.initialize_async_clients()
+                
             # Get the request body
             request_body = request.api_specific_request
-
-            # Use Converse API
-            # Prepare parameters for converse API
-            params = {
-                "modelId": self.model_id,
-                "messages": request_body["messages"]
-            }
-
-            # Add system message if present, formatted as a list of dictionaries with text field
-            if request_body.get("system"):
-                params["system"] = [{"text": request_body["system"]}]
-
-            # Add inference config if present
-            if request_body.get("inferenceConfig"):
-                params["inferenceConfig"] = {
-                    "temperature": request_body["inferenceConfig"].get("temperature"),
-                    "topP": request_body["inferenceConfig"].get("topP"),
-                    "maxTokens": request_body["inferenceConfig"].get("maxTokens"),
-                    "stopSequences": request_body["inferenceConfig"].get("stopSequences")
+            
+            # Determine which API to use based on request format
+            use_converse_api = "messages" in request_body and (
+                "system" in request_body or
+                any(isinstance(msg.get("content"), list) for msg in request_body["messages"]
+                    if isinstance(msg, dict))
+            )
+            
+            if use_converse_api:
+                # Prepare parameters for converse API
+                params = {
+                    "modelId": self.model_id,
+                    "messages": request_body["messages"]
                 }
 
-            response = self.bedrock_runtime.converse(**params)
-            response_body = response
-            text_response, token_usage = self._extract_converse_response(response_body)
+                # Add system message if present
+                if request_body.get("system"):
+                    if isinstance(request_body["system"], str):
+                        params["system"] = [{"text": request_body["system"]}]
+                    else:
+                        params["system"] = request_body["system"]
+
+                # Add inference config if present
+                if request_body.get("inferenceConfig"):
+                    params["inferenceConfig"] = {
+                        "temperature": request_body["inferenceConfig"].get("temperature"),
+                        "topP": request_body["inferenceConfig"].get("topP"),
+                        "maxTokens": request_body["inferenceConfig"].get("maxTokens"),
+                        "stopSequences": request_body["inferenceConfig"].get("stopSequences")
+                    }
+
+                logger.debug(f"Making Converse API request for {request_id}")
+                response = await self.async_bedrock_runtime.converse(**params)
+                response_body = response
+                text_response, token_usage = self._extract_converse_response(response_body)
+            else:
+                # Use invoke_model API for non-chat requests
+                logger.debug(f"Making invoke_model API request for {request_id}")
+                response = await self.async_bedrock_runtime.invoke_model(
+                    modelId=self.model_id,
+                    body=json.dumps(request_body)
+                )
+                
+                # Parse response based on model provider
+                response_body = json.loads(await response["body"].read())
+                
+                # Extract text and token usage based on provider
+                if self.model_provider == "anthropic":
+                    text_response = response_body.get("completion", "")
+                    token_usage = _TokenUsage(
+                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
+                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    )
+                elif self.model_provider == "amazon":
+                    text_response = response_body.get("results", [{}])[0].get("outputText", "")
+                    # Amazon doesn't provide token counts, estimate based on text length
+                    token_usage = _TokenUsage(
+                        input_tokens=len(request_body.get("inputText", "")) // 4,
+                        output_tokens=len(text_response) // 4
+                    )
+                else:
+                    # Generic fallback for other providers
+                    text_response = str(response_body)
+                    token_usage = _TokenUsage(input_tokens=0, output_tokens=0)
+
+            # Record token usage for future estimation
+            if token_usage and token_usage.output_tokens > 0:
+                self.token_count_history.append((time.time(), token_usage.output_tokens))
+                # Keep history to a reasonable size
+                if len(self.token_count_history) > self.max_token_history:
+                    self.token_count_history.pop(0)
 
             # Get current time for timestamps
             current_time = datetime.datetime.now(datetime.UTC)
+            
+            # Calculate latency
+            latency = time.time() - start_time
+            
+            # Log response details with structured logging
+            logger.info(
+                f"Request {request_id} completed in {latency:.2f}s",
+                extra={
+                    "request_id": request_id,
+                    "latency": latency,
+                    "input_tokens": token_usage.input_tokens if token_usage else 0,
+                    "output_tokens": token_usage.output_tokens if token_usage else 0,
+                    "model_id": self.model_id
+                }
+            )
+            
+            # Publish metrics if enabled
+            if self.enable_metrics:
+                self._publish_request_metrics(request_id, token_usage, latency)
 
             # Create and return the response
             return GenericResponse(
@@ -801,5 +1095,134 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             )
 
         except Exception as e:
-            logger.error(f"Error making API request: {str(e)}")
+            # Log error with structured logging
+            latency = time.time() - start_time
+            logger.error(
+                f"Error making API request: {str(e)}",
+                extra={
+                    "request_id": request_id,
+                    "error": str(e),
+                    "latency": latency,
+                    "model_id": self.model_id
+                }
+            )
+            
+            # Publish error metrics if enabled
+            if self.enable_metrics:
+                self._publish_error_metrics(request_id, str(e), latency)
+                
             raise
+            
+    def _publish_request_metrics(self, request_id: str, token_usage: _TokenUsage, latency: float):
+        """Publish request metrics to CloudWatch.
+        
+        Args:
+            request_id: Unique identifier for the request
+            token_usage: Token usage information
+            latency: Request latency in seconds
+        """
+        if not self.enable_metrics or not self.cloudwatch_client:
+            return
+            
+        try:
+            metrics = [
+                {
+                    'MetricName': 'Latency',
+                    'Dimensions': [
+                        {'Name': 'ModelId', 'Value': self.model_id},
+                        {'Name': 'Provider', 'Value': self.model_provider}
+                    ],
+                    'Unit': 'Seconds',
+                    'Value': latency
+                },
+                {
+                    'MetricName': 'InputTokens',
+                    'Dimensions': [
+                        {'Name': 'ModelId', 'Value': self.model_id},
+                        {'Name': 'Provider', 'Value': self.model_provider}
+                    ],
+                    'Unit': 'Count',
+                    'Value': token_usage.input_tokens if token_usage else 0
+                },
+                {
+                    'MetricName': 'OutputTokens',
+                    'Dimensions': [
+                        {'Name': 'ModelId', 'Value': self.model_id},
+                        {'Name': 'Provider', 'Value': self.model_provider}
+                    ],
+                    'Unit': 'Count',
+                    'Value': token_usage.output_tokens if token_usage else 0
+                },
+                {
+                    'MetricName': 'RequestCount',
+                    'Dimensions': [
+                        {'Name': 'ModelId', 'Value': self.model_id},
+                        {'Name': 'Provider', 'Value': self.model_provider}
+                    ],
+                    'Unit': 'Count',
+                    'Value': 1.0
+                }
+            ]
+            
+            self.cloudwatch_client.put_metric_data(
+                Namespace=self.metrics_namespace,
+                MetricData=metrics
+            )
+            
+            logger.debug(f"Published metrics for request {request_id}")
+        except Exception as e:
+            logger.warning(f"Failed to publish metrics: {str(e)}")
+            
+    def _publish_error_metrics(self, request_id: str, error_message: str, latency: float):
+        """Publish error metrics to CloudWatch.
+        
+        Args:
+            request_id: Unique identifier for the request
+            error_message: Error message
+            latency: Request latency in seconds
+        """
+        if not self.enable_metrics or not self.cloudwatch_client:
+            return
+            
+        try:
+            # Extract error type from error message
+            error_type = "Unknown"
+            if "throttling" in error_message.lower():
+                error_type = "Throttling"
+            elif "timeout" in error_message.lower():
+                error_type = "Timeout"
+            elif "not found" in error_message.lower():
+                error_type = "NotFound"
+            elif "permission" in error_message.lower():
+                error_type = "Permission"
+            
+            metrics = [
+                {
+                    'MetricName': 'ErrorCount',
+                    'Dimensions': [
+                        {'Name': 'ModelId', 'Value': self.model_id},
+                        {'Name': 'Provider', 'Value': self.model_provider},
+                        {'Name': 'ErrorType', 'Value': error_type}
+                    ],
+                    'Unit': 'Count',
+                    'Value': 1.0
+                },
+                {
+                    'MetricName': 'ErrorLatency',
+                    'Dimensions': [
+                        {'Name': 'ModelId', 'Value': self.model_id},
+                        {'Name': 'Provider', 'Value': self.model_provider}
+                    ],
+                    'Unit': 'Seconds',
+                    'Value': latency
+                }
+            ]
+            
+            self.cloudwatch_client.put_metric_data(
+                Namespace=self.metrics_namespace,
+                MetricData=metrics
+            )
+            
+            logger.debug(f"Published error metrics for request {request_id}")
+        except Exception as e:
+            logger.warning(f"Failed to publish error metrics: {str(e)}")

@@ -446,6 +446,10 @@ def main():
             "test_bedrock_implementation.py",
             "test_bedrock_batch.py",
             "test_bedrock_batch_processor.py",
+
+            # Integration tests in tests/integrations/bedrock
+            "../../../tests/integrations/bedrock/test_bedrock_online.py",
+            "../../../tests/integrations/bedrock/test_bedrock_batch.py",
         ]
 
     # Run each test
