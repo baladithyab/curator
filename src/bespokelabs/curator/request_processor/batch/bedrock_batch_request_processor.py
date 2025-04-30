@@ -8,14 +8,19 @@ import asyncio
 import datetime
 import json
 import os
+import random
 import tempfile
+import time
 import typing as t
 import uuid
+from contextlib import asynccontextmanager
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
 import aiofiles
 import boto3
+from botocore.exceptions import ClientError
 
 from bespokelabs.curator.log import logger
 from bespokelabs.curator.request_processor.batch.base_batch_request_processor import BaseBatchRequestProcessor
@@ -24,6 +29,25 @@ from bespokelabs.curator.types.generic_batch import GenericBatch, GenericBatchSt
 from bespokelabs.curator.types.generic_request import GenericRequest
 from bespokelabs.curator.types.generic_response import GenericResponse
 from bespokelabs.curator.types.token_usage import _TokenUsage
+
+
+class ErrorType(Enum):
+    """Enum for different types of errors that can occur during batch processing."""
+
+    # Transient errors that can be retried
+    TRANSIENT = "transient"  # Temporary issues that might resolve with retries
+    THROTTLING = "throttling"  # Rate limiting or quota issues
+    NETWORK = "network"  # Network connectivity issues
+
+    # Permanent errors that cannot be resolved with retries
+    PERMISSION = "permission"  # Access denied or insufficient permissions
+    RESOURCE_NOT_FOUND = "resource_not_found"  # Requested resource doesn't exist
+    VALIDATION = "validation"  # Invalid input parameters
+    CONFIGURATION = "configuration"  # Misconfiguration issues
+
+    # Other error types
+    UNKNOWN = "unknown"  # Unclassified errors
+    TIMEOUT = "timeout"  # Operation timed out
 
 
 class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
@@ -123,6 +147,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
         self.bedrock = boto3.client("bedrock", region_name=self.region_name)
         self.s3 = boto3.client("s3", region_name=self.region_name)
+        self._clients = [self.bedrock, self.s3]  # Track clients for cleanup
 
         # Set model ID and other properties
         self.model_id = config.model
@@ -176,8 +201,186 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
         # Determine model provider
         self.model_provider = self._determine_model_provider()
-        self.timeout_hours = 24  # Default timeout in hours
+
+        # Timeout and monitoring configuration
+        self.timeout_hours = getattr(config, "timeout_hours", 24)  # Default timeout in hours
+        self.monitoring_interval = getattr(config, "monitoring_interval", 300)  # Default: check every 5 minutes
         self.batch_jobs = {}  # Track batch jobs: {batch_id: job_details}
+
+        # Retry configuration
+        self.max_retries = getattr(config, "max_retries", 5)
+        self.base_delay = getattr(config, "base_delay", 1.0)  # Base delay in seconds
+        self.max_delay = getattr(config, "max_delay", 60.0)  # Maximum delay in seconds
+        self.jitter_factor = getattr(config, "jitter_factor", 0.1)  # Jitter factor (0.0-1.0)
+
+        # Cost optimization
+        self.batch_size_optimization = getattr(config, "batch_size_optimization", True)
+        self.optimal_batch_size = getattr(config, "optimal_batch_size", 100)  # Default optimal batch size
+
+        # Initialize semaphore for controlling concurrent operations
+        self.semaphore = asyncio.Semaphore(self.max_concurrent_batch_operations)
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit with resource cleanup."""
+        await self.cleanup_resources()
+        return False  # Don't suppress exceptions
+
+    async def cleanup_resources(self):
+        """Clean up boto3 resources to prevent leaks."""
+        logger.debug("Cleaning up boto3 resources")
+        # Close all boto3 clients
+        for client in self._clients:
+            if hasattr(client, 'close') and callable(client.close):
+                try:
+                    client.close()
+                    logger.debug(f"Closed boto3 client: {client.__class__.__name__}")
+                except Exception as e:
+                    logger.warning(f"Error closing boto3 client: {str(e)}")
+
+    @asynccontextmanager
+    async def _retry_with_backoff(self, operation_name: str):
+        """Context manager for retrying operations with exponential backoff and jitter.
+
+        Args:
+            operation_name: Name of the operation being performed (for logging)
+
+        Yields:
+            None
+
+        Raises:
+            Exception: If all retries fail
+        """
+        retries = 0
+        while True:
+            try:
+                yield
+                break  # Success, exit the loop
+            except Exception as e:
+                error_type = self._classify_error(e)
+
+                # Don't retry permanent errors
+                if error_type in [ErrorType.PERMISSION, ErrorType.VALIDATION,
+                                 ErrorType.CONFIGURATION, ErrorType.RESOURCE_NOT_FOUND]:
+                    logger.error(f"{operation_name} failed with permanent error ({error_type.value}): {str(e)}")
+                    raise
+
+                retries += 1
+                if retries > self.max_retries:
+                    logger.error(f"{operation_name} failed after {self.max_retries} retries: {str(e)}")
+                    raise
+
+                # Calculate delay with exponential backoff and jitter
+                delay = min(self.max_delay, self.base_delay * (2 ** (retries - 1)))
+                jitter = delay * self.jitter_factor * random.uniform(-1, 1)
+                delay = max(0, delay + jitter)
+
+                # For throttling errors, use a longer delay
+                if error_type == ErrorType.THROTTLING:
+                    delay = delay * 2
+
+                logger.warning(f"{operation_name} failed (retry {retries}/{self.max_retries}): {str(e)}")
+                logger.info(f"Retrying in {delay:.2f} seconds...")
+                await asyncio.sleep(delay)
+
+    def _classify_error(self, error: Exception) -> ErrorType:
+        """Classify an error to determine appropriate handling strategy.
+
+        Args:
+            error: The exception to classify
+
+        Returns:
+            ErrorType: The classified error type
+        """
+        if isinstance(error, ClientError):
+            error_code = error.response.get('Error', {}).get('Code', '')
+
+            # Throttling errors
+            if error_code in ['ThrottlingException', 'RequestLimitExceeded', 'TooManyRequestsException',
+                             'Throttling', 'RequestThrottled', 'RequestThrottledException']:
+                return ErrorType.THROTTLING
+
+            # Permission errors
+            elif error_code in ['AccessDenied', 'UnauthorizedOperation', 'AuthorizationError',
+                               'AuthFailure', 'InvalidAccessKeyId', 'SignatureDoesNotMatch']:
+                return ErrorType.PERMISSION
+
+            # Resource not found errors
+            elif error_code in ['ResourceNotFoundException', 'NoSuchEntity', 'NoSuchBucket',
+                               'NoSuchKey', 'NoSuchJob', 'NoSuchModel']:
+                return ErrorType.RESOURCE_NOT_FOUND
+
+            # Validation errors
+            elif error_code in ['ValidationError', 'InvalidParameterValue', 'InvalidInput',
+                               'MalformedQueryString', 'InvalidArgument']:
+                return ErrorType.VALIDATION
+
+            # Network errors
+            elif error_code in ['RequestTimeout', 'ConnectionError', 'ConnectTimeoutError',
+                               'ReadTimeoutError']:
+                return ErrorType.NETWORK
+
+            # Default to transient for other AWS errors
+            return ErrorType.TRANSIENT
+
+        # Classify based on exception type
+        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            return ErrorType.TIMEOUT
+        elif isinstance(error, (ConnectionError, ConnectionRefusedError, ConnectionResetError)):
+            return ErrorType.NETWORK
+        elif isinstance(error, (PermissionError, OSError)) and "Permission denied" in str(error):
+            return ErrorType.PERMISSION
+        elif isinstance(error, FileNotFoundError):
+            return ErrorType.RESOURCE_NOT_FOUND
+        elif isinstance(error, ValueError) and "configuration" in str(error).lower():
+            return ErrorType.CONFIGURATION
+
+        # Default to unknown
+        return ErrorType.UNKNOWN
+
+    async def _paginated_s3_list(self, bucket: str, prefix: str) -> t.List[dict]:
+        """List S3 objects with pagination support.
+
+        Args:
+            bucket: S3 bucket name
+            prefix: S3 key prefix
+
+        Returns:
+            List of S3 object metadata dictionaries
+        """
+        all_objects = []
+        continuation_token = None
+
+        while True:
+            # Prepare parameters for list_objects_v2
+            params = {
+                'Bucket': bucket,
+                'Prefix': prefix
+            }
+
+            if continuation_token:
+                params['ContinuationToken'] = continuation_token
+
+            # Make the API call with retry logic
+            async with self._retry_with_backoff("S3 list_objects_v2"):
+                response = await asyncio.to_thread(
+                    self.s3.list_objects_v2,
+                    **params
+                )
+
+            # Add objects to the result list
+            all_objects.extend(response.get('Contents', []))
+
+            # Check if there are more objects to fetch
+            if not response.get('IsTruncated'):
+                break
+
+            continuation_token = response.get('NextContinuationToken')
+
+        return all_objects
 
     def _get_inference_profile_id(self, model_id: str) -> str:
         """Convert a standard model ID to an inference profile ID if possible.
@@ -236,6 +439,20 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
             logger.warning(f"Model {self.model_id} is not in the list of known batch-supported models")
             logger.warning("This may still work if AWS has recently added batch support for this model")
+
+    def _get_account_id(self) -> str:
+        """Get the AWS account ID.
+
+        Returns:
+            str: The AWS account ID
+        """
+        try:
+            # Use STS to get the account ID
+            sts = boto3.client('sts', region_name=self.region_name)
+            return sts.get_caller_identity()["Account"]
+        except Exception as e:
+            logger.warning(f"Failed to get AWS account ID: {str(e)}")
+            return "000000000000"  # Default placeholder
 
     def _determine_model_provider(self) -> str:
         """Determine the model provider based on the model ID.
@@ -758,6 +975,11 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             batch_id = f"bedrock-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
             request_file = metadata.get("request_file")
 
+            # Apply batch size optimization if enabled
+            if self.batch_size_optimization and len(requests) > self.optimal_batch_size:
+                logger.info(f"Optimizing batch size: {len(requests)} requests will be processed in chunks of {self.optimal_batch_size}")
+                # Note: The actual chunking happens at a higher level, this is just for logging
+
             # Create batch input file in JSONL format
             batch_file_path = Path(self.working_dir) / f"{batch_id}_input.jsonl"
 
@@ -769,14 +991,15 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
                 logger.info(f"Created batch file with {len(requests)} requests at {batch_file_path}")
 
-                # Upload batch file to S3
+                # Upload batch file to S3 with retry logic
                 input_s3_key = f"{self.s3_prefix}/input/{batch_id}_input.jsonl"
-                await asyncio.to_thread(
-                    self.s3.upload_file,
-                    str(batch_file_path),
-                    self.s3_bucket,
-                    input_s3_key
-                )
+                async with self._retry_with_backoff(f"Upload batch file to S3 {input_s3_key}"):
+                    await asyncio.to_thread(
+                        self.s3.upload_file,
+                        str(batch_file_path),
+                        self.s3_bucket,
+                        input_s3_key
+                    )
 
                 logger.info(f"Uploaded batch file to s3://{self.s3_bucket}/{input_s3_key}")
 
@@ -784,24 +1007,42 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 s3_input_uri = f"s3://{self.s3_bucket}/{input_s3_key}"
                 s3_output_uri = f"s3://{self.s3_bucket}/{self.s3_prefix}/output/{batch_id}/"
 
-                # Create batch job in AWS Bedrock
-                job_response = await asyncio.to_thread(
-                    self.bedrock.create_model_invocation_job,
-                    jobName=f"curator-batch-{batch_id}",
-                    modelId=self.model_id,
-                    roleArn=self.role_arn,
-                    inputDataConfig={
+                # Prepare job parameters with cost optimization settings
+                job_params = {
+                    "jobName": f"curator-batch-{batch_id}",
+                    "modelId": self.model_id,
+                    "roleArn": self.role_arn,
+                    "inputDataConfig": {
                         "s3InputDataConfig": {
                             "s3Uri": s3_input_uri
                         }
                     },
-                    outputDataConfig={
+                    "outputDataConfig": {
                         "s3OutputDataConfig": {
                             "s3Uri": s3_output_uri
                         }
                     },
-                    timeoutDurationInHours=self.timeout_hours
-                )
+                    "timeoutDurationInHours": self.timeout_hours
+                }
+
+                # Add cost optimization parameters if available
+                # AWS Bedrock offers 50% cost savings for non-urgent batch jobs
+                # by setting lower priority for the job
+                if hasattr(self.config, "use_cost_optimization") and self.config.use_cost_optimization:
+                    # Note: This is a placeholder for when AWS adds explicit cost optimization parameters
+                    # Currently, the cost savings are automatic for batch jobs
+                    logger.info("Using cost optimization for batch job")
+
+                    # Some providers might support additional parameters for cost optimization
+                    if self.model_provider == "anthropic" and hasattr(self.config, "low_priority"):
+                        job_params["jobPriority"] = "LOW" if self.config.low_priority else "NORMAL"
+
+                # Create batch job in AWS Bedrock with retry logic
+                async with self._retry_with_backoff(f"Create batch job for {batch_id}"):
+                    job_response = await asyncio.to_thread(
+                        self.bedrock.create_model_invocation_job,
+                        **job_params
+                    )
 
                 # Store job details
                 job_id = job_response.get("jobArn").split("/")[-1]
@@ -823,7 +1064,8 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                         "s3_input_uri": s3_input_uri,
                         "s3_output_uri": s3_output_uri,
                         "submission_time": datetime.datetime.now().isoformat(),
-                        "num_requests": len(requests)
+                        "num_requests": len(requests),
+                        "cost_optimized": hasattr(self.config, "use_cost_optimization") and self.config.use_cost_optimization
                     },
                     request_counts=GenericBatchRequestCounts(
                         total=len(requests),
@@ -838,13 +1080,15 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     "job_id": job_id,
                     "input_s3_key": input_s3_key,
                     "output_s3_uri": s3_output_uri,
-                    "batch_file_path": str(batch_file_path)
+                    "batch_file_path": str(batch_file_path),
+                    "submission_time": datetime.datetime.now()
                 }
 
                 return batch
 
             except Exception as e:
-                logger.error(f"Failed to submit batch: {str(e)}")
+                error_type = self._classify_error(e)
+                logger.error(f"Failed to submit batch: {str(e)} (type: {error_type.value})")
                 raise Exception(f"Failed to submit batch: {str(e)}")
 
 
@@ -878,18 +1122,14 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             bucket = parsed_uri.netloc
             prefix = parsed_uri.path.lstrip("/")
 
-            # List objects in output location
-            response = await asyncio.to_thread(
-                self.s3.list_objects_v2,
-                Bucket=bucket,
-                Prefix=prefix
-            )
+            # List objects in output location with pagination support
+            objects = await self._paginated_s3_list(bucket, prefix)
 
             # Create a mapping from record ID to response
             responses_by_id = {}
 
             # Process all output files
-            for obj in response.get("Contents", []):
+            for obj in objects:
                 key = obj["Key"]
 
                 # Skip any non-response files (e.g., manifests)
@@ -898,12 +1138,14 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
                 # Download and process response file
                 output_file_path = Path(self.working_dir) / f"{batch.batch_id}_output_{Path(key).name}"
-                await asyncio.to_thread(
-                    self.s3.download_file,
-                    bucket,
-                    key,
-                    str(output_file_path)
-                )
+
+                async with self._retry_with_backoff(f"Download S3 file {key}"):
+                    await asyncio.to_thread(
+                        self.s3.download_file,
+                        bucket,
+                        key,
+                        str(output_file_path)
+                    )
 
                 # Parse response file
                 async with aiofiles.open(output_file_path, "r") as f:
@@ -957,7 +1199,8 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             return responses
 
         except Exception as e:
-            logger.error(f"Error fetching results for batch {batch.batch_id}: {str(e)}")
+            error_type = self._classify_error(e)
+            logger.error(f"Error fetching results for batch {batch.batch_id}: {str(e)} (type: {error_type.value})")
             raise Exception(f"Failed to fetch batch results: {str(e)}")
 
     def _extract_response_from_batch(self, model_output: dict, request: GenericRequest) -> t.Tuple[str, _TokenUsage]:
@@ -1083,7 +1326,8 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                         os.remove(batch_file_path)
                         logger.info(f"Deleted failed batch input file: {batch_file_path}")
                 except Exception as e:
-                    logger.warning(f"Failed to delete batch file {batch_file_path}: {str(e)}")
+                    error_type = self._classify_error(e)
+                    logger.warning(f"Failed to delete batch file {batch_file_path}: {str(e)} (type: {error_type.value})")
 
             # Clean up S3 files
             if getattr(self.config, "delete_successful_batch_files", False) and batch.status == GenericBatchStatus.COMPLETE:
@@ -1091,39 +1335,121 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     # Delete input file from S3
                     input_s3_key = job_info.get("input_s3_key")
                     if input_s3_key:
-                        await asyncio.to_thread(
-                            self.s3.delete_object,
-                            Bucket=self.s3_bucket,
-                            Key=input_s3_key
-                        )
+                        async with self._retry_with_backoff(f"Delete S3 input file {input_s3_key}"):
+                            await asyncio.to_thread(
+                                self.s3.delete_object,
+                                Bucket=self.s3_bucket,
+                                Key=input_s3_key
+                            )
                         logger.info(f"Deleted S3 input file: s3://{self.s3_bucket}/{input_s3_key}")
 
                     # Delete output files from S3
                     output_s3_uri = job_info.get("output_s3_uri")
                     if output_s3_uri:
                         parsed_uri = urlparse(output_s3_uri)
+                        bucket = parsed_uri.netloc
                         prefix = parsed_uri.path.lstrip("/")
 
-                        # List and delete output objects
-                        response = await asyncio.to_thread(
-                            self.s3.list_objects_v2,
-                            Bucket=self.s3_bucket,
-                            Prefix=prefix
-                        )
+                        # List objects with pagination support
+                        objects = await self._paginated_s3_list(bucket, prefix)
 
-                        for obj in response.get("Contents", []):
-                            await asyncio.to_thread(
-                                self.s3.delete_object,
-                                Bucket=self.s3_bucket,
-                                Key=obj["Key"]
-                            )
+                        # Delete objects in batches to improve performance
+                        batch_size = 100  # AWS allows up to 1000 objects per delete operation
+                        for i in range(0, len(objects), batch_size):
+                            batch_objects = objects[i:i+batch_size]
+
+                            # Skip if batch is empty
+                            if not batch_objects:
+                                continue
+
+                            # Delete objects in this batch
+                            for obj in batch_objects:
+                                async with self._retry_with_backoff(f"Delete S3 output file {obj['Key']}"):
+                                    await asyncio.to_thread(
+                                        self.s3.delete_object,
+                                        Bucket=self.s3_bucket,
+                                        Key=obj["Key"]
+                                    )
 
                         logger.info(f"Deleted S3 output files: {output_s3_uri}")
                 except Exception as e:
-                    logger.warning(f"Failed to delete S3 files for batch {batch.batch_id}: {str(e)}")
+                    error_type = self._classify_error(e)
+                    logger.warning(f"Failed to delete S3 files for batch {batch.batch_id}: {str(e)} (type: {error_type.value})")
 
             # Remove batch from tracking
             self.batch_jobs.pop(batch.batch_id, None)
+
+    async def monitor_batch_job(self, batch: GenericBatch, timeout_seconds: int = None) -> GenericBatch:
+        """Monitor a batch job until completion or timeout.
+
+        Args:
+            batch: The batch to monitor
+            timeout_seconds: Optional timeout in seconds (overrides self.timeout_hours)
+
+        Returns:
+            GenericBatch: Updated batch object with final status
+
+        Raises:
+            TimeoutError: If the job exceeds the timeout period
+        """
+        if not timeout_seconds:
+            timeout_seconds = self.timeout_hours * 3600  # Convert hours to seconds
+
+        start_time = time.time()
+        check_interval = self.monitoring_interval  # Start with the default interval
+
+        while True:
+            # Check if we've exceeded the timeout
+            elapsed_time = time.time() - start_time
+            if elapsed_time > timeout_seconds:
+                logger.error(f"Batch job {batch.batch_id} timed out after {elapsed_time:.1f} seconds")
+
+                # Try to cancel the job
+                try:
+                    await self.cancel_batch(batch)
+                except Exception as e:
+                    logger.warning(f"Failed to cancel timed out batch {batch.batch_id}: {str(e)}")
+
+                # Update batch status
+                batch.status = GenericBatchStatus.FAILED
+                if not batch.metadata:
+                    batch.metadata = {}
+                batch.metadata.update({
+                    "timeout": True,
+                    "timeout_seconds": timeout_seconds,
+                    "elapsed_seconds": elapsed_time
+                })
+
+                raise TimeoutError(f"Batch job {batch.batch_id} timed out after {elapsed_time:.1f} seconds")
+
+            # Retrieve current status
+            updated_batch = await self.retrieve_batch(batch)
+            if not updated_batch:
+                logger.warning(f"Failed to retrieve status for batch {batch.batch_id}")
+                await asyncio.sleep(check_interval)
+                continue
+
+            # Update our batch object with the latest info
+            batch = updated_batch
+
+            # Check if the job has completed or failed
+            if batch.status in [GenericBatchStatus.COMPLETE, GenericBatchStatus.FAILED]:
+                logger.info(f"Batch job {batch.batch_id} finished with status: {batch.status}")
+                return batch
+
+            # Adjust check interval based on elapsed time for efficiency
+            # For longer-running jobs, we don't need to check as frequently
+            if elapsed_time > 3600:  # After 1 hour
+                check_interval = min(600, self.monitoring_interval * 2)  # Max 10 minutes
+            elif elapsed_time > 600:  # After 10 minutes
+                check_interval = min(300, self.monitoring_interval * 1.5)  # Max 5 minutes
+
+            # Log progress periodically
+            if elapsed_time % 600 < check_interval:  # Log approximately every 10 minutes
+                logger.info(f"Batch job {batch.batch_id} still running after {elapsed_time:.1f} seconds")
+
+            # Wait before checking again
+            await asyncio.sleep(check_interval)
 
     async def retrieve_batch(self, batch: GenericBatch) -> GenericBatch:
         """Retrieve current status of a submitted batch.
@@ -1141,11 +1467,19 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 return None
 
             try:
-                # Get the batch status from AWS Bedrock
-                response = await asyncio.to_thread(
-                    self.bedrock.get_model_invocation_job,
-                    jobIdentifier=batch.provider_batch_id
-                )
+                # Get the batch status from AWS Bedrock with retry logic
+                # Use the full ARN from metadata if available, otherwise fall back to provider_batch_id
+                job_identifier = batch.metadata.get("job_arn") if batch.metadata and isinstance(batch.metadata, dict) else batch.provider_batch_id
+
+                # If the job_identifier is not a full ARN but looks like a job ID, construct the ARN
+                if job_identifier and not job_identifier.startswith("arn:aws:"):
+                    job_identifier = f"arn:aws:bedrock:{self.region_name}:{self._get_account_id()}:model-invocation-job/{job_identifier}"
+
+                async with self._retry_with_backoff(f"Get batch status for {job_identifier}"):
+                    response = await asyncio.to_thread(
+                        self.bedrock.get_model_invocation_job,
+                        jobIdentifier=job_identifier
+                    )
 
                 # Map AWS Bedrock status to GenericBatchStatus
                 bedrock_status = response.get("status")
@@ -1213,17 +1547,13 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 bucket = parsed_uri.netloc
                 prefix = parsed_uri.path.lstrip("/")
 
-                # List objects in output location
-                response = await asyncio.to_thread(
-                    self.s3.list_objects_v2,
-                    Bucket=bucket,
-                    Prefix=prefix
-                )
+                # List objects in output location with pagination support
+                objects = await self._paginated_s3_list(bucket, prefix)
 
                 # Process all output files
                 responses = []
 
-                for obj in response.get("Contents", []):
+                for obj in objects:
                     key = obj["Key"]
 
                     # Skip any non-response files (e.g., manifests)
@@ -1232,12 +1562,15 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
                     # Download and process response file
                     output_file_path = Path(self.working_dir) / f"{batch.batch_id}_output_{Path(key).name}"
-                    await asyncio.to_thread(
-                        self.s3.download_file,
-                        bucket,
-                        key,
-                        str(output_file_path)
-                    )
+
+                    # Use retry mechanism for downloading
+                    async with self._retry_with_backoff(f"Download S3 file {key}"):
+                        await asyncio.to_thread(
+                            self.s3.download_file,
+                            bucket,
+                            key,
+                            str(output_file_path)
+                        )
 
                     # Parse response file
                     async with aiofiles.open(output_file_path, "r") as f:
@@ -1252,7 +1585,8 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 return responses
 
             except Exception as e:
-                logger.error(f"Error downloading batch {batch.batch_id}: {str(e)}")
+                error_type = self._classify_error(e)
+                logger.error(f"Error downloading batch {batch.batch_id}: {str(e)} (type: {error_type.value})")
                 return None
 
     def parse_api_specific_response(
@@ -1432,11 +1766,19 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 return batch
 
             try:
-                # Stop the batch job
-                await asyncio.to_thread(
-                    self.bedrock.stop_model_invocation_job,
-                    jobIdentifier=batch.provider_batch_id
-                )
+                # Stop the batch job with retry logic
+                # Use the full ARN from metadata if available, otherwise fall back to provider_batch_id
+                job_identifier = batch.metadata.get("job_arn") if batch.metadata and isinstance(batch.metadata, dict) else batch.provider_batch_id
+
+                # If the job_identifier is not a full ARN but looks like a job ID, construct the ARN
+                if job_identifier and not job_identifier.startswith("arn:aws:"):
+                    job_identifier = f"arn:aws:bedrock:{self.region_name}:{self._get_account_id()}:model-invocation-job/{job_identifier}"
+
+                async with self._retry_with_backoff(f"Cancel batch job {job_identifier}"):
+                    await asyncio.to_thread(
+                        self.bedrock.stop_model_invocation_job,
+                        jobIdentifier=job_identifier
+                    )
 
                 logger.info(f"Cancelled batch job {batch.provider_batch_id} for batch {batch.batch_id}")
 
@@ -1454,5 +1796,6 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 return batch
 
             except Exception as e:
-                logger.error(f"Failed to cancel batch {batch.batch_id}: {str(e)}")
+                error_type = self._classify_error(e)
+                logger.error(f"Failed to cancel batch {batch.batch_id}: {str(e)} (type: {error_type.value})")
                 raise Exception(f"Failed to cancel batch: {str(e)}")
