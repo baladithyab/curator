@@ -8,18 +8,19 @@ import asyncio
 import datetime
 import json
 import os
+import tempfile
 import typing as t
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 import aiofiles
 import boto3
-from botocore.exceptions import ClientError
 
 from bespokelabs.curator.log import logger
 from bespokelabs.curator.request_processor.batch.base_batch_request_processor import BaseBatchRequestProcessor
 from bespokelabs.curator.request_processor.config import BatchRequestProcessorConfig
-from bespokelabs.curator.types.generic_batch import GenericBatch, GenericBatchStatus
+from bespokelabs.curator.types.generic_batch import GenericBatch, GenericBatchStatus, GenericBatchRequestCounts
 from bespokelabs.curator.types.generic_request import GenericRequest
 from bespokelabs.curator.types.generic_response import GenericResponse
 from bespokelabs.curator.types.token_usage import _TokenUsage
@@ -51,14 +52,14 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         "anthropic.claude-3-5-haiku-20241022-v1:0",
         "anthropic.claude-3-5-sonnet-20241022-v2:0",
         "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        
+
         # Amazon models
         "amazon.titan-multimodal-embeddings-g1-v1",
         "amazon.titan-text-embeddings-v2",
         "amazon.nova-lite-v1:0",
         "amazon.nova-micro-v1:0",
         "amazon.nova-pro-v1:0",
-        
+
         # Meta Llama models
         "meta.llama3-1-8b-instruct-v1:0",
         "meta.llama3-1-70b-instruct-v1:0",
@@ -68,7 +69,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         "meta.llama3-2-11b-instruct-v1:0",
         "meta.llama3-2-90b-instruct-v1:0",
         "meta.llama3-3-70b-instruct-v1:0",
-        
+
         # Mistral AI models
         "mistral.mistral-small-2402-v1:0",  # Mistral Small (24.02)
         "mistral.mistral-large-2407-v1:0",  # Mistral Large (24.07)
@@ -107,7 +108,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
     ]
 
     def __init__(
-        self, 
+        self,
         config: BatchRequestProcessorConfig,
         region_name: str = None,
         s3_bucket: str = None,
@@ -117,24 +118,51 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
     ):
         """Initialize the BedrockBatchRequestProcessor."""
         super().__init__(config)
-        
+
         # Initialize AWS clients
         self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
         self.bedrock = boto3.client("bedrock", region_name=self.region_name)
         self.s3 = boto3.client("s3", region_name=self.region_name)
-        
+
+        # Set model ID and other properties
+        self.model_id = config.model
+        self.model_provider = self._determine_model_provider()
+
+        # Initialize prompt formatter with default values if not set by parent class
+        from bespokelabs.curator.llm.prompt_formatter import PromptFormatter
+        if not hasattr(self, 'prompt_formatter'):
+            def default_prompt_func(row):
+                if isinstance(row, str):
+                    return row
+                return row.get("prompt", "")
+
+            self.prompt_formatter = PromptFormatter(
+                model_name=self.model_id,
+                prompt_func=default_prompt_func
+            )
+
+        # Initialize other required attributes
+        self.total_requests = 1  # Default value, will be updated when processing actual requests
+        self.working_dir = tempfile.mkdtemp() if not hasattr(self, 'working_dir') else self.working_dir
+
+        # Initialize viewer client with a dummy implementation if not set
+        if not hasattr(self, '_viewer_client') or self._viewer_client is None:
+            # Import the actual Client class
+            from bespokelabs.curator.client import Client
+            self._viewer_client = Client()
+
         # S3 configuration - critical for batch processing
         self.s3_bucket = s3_bucket or os.environ.get("BEDROCK_BATCH_S3_BUCKET")
         if not self.s3_bucket:
             raise ValueError("S3 bucket must be provided for Bedrock batch processing")
-        
+
         self.s3_prefix = s3_prefix or os.environ.get("BEDROCK_BATCH_S3_PREFIX", "bedrock-batch")
-        
+
         # IAM role for batch jobs
         self.role_arn = role_arn or os.environ.get("BEDROCK_BATCH_ROLE_ARN")
         if not self.role_arn:
             raise ValueError("IAM role ARN must be provided for Bedrock batch processing")
-        
+
         # Batch job tracking
         self.model_id = config.model
         self.use_inference_profile = use_inference_profile
@@ -145,7 +173,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
         # Check if model supports batch inference
         self._validate_batch_support()
-        
+
         # Determine model provider
         self.model_provider = self._determine_model_provider()
         self.timeout_hours = 24  # Default timeout in hours
@@ -153,10 +181,10 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
     def _get_inference_profile_id(self, model_id: str) -> str:
         """Convert a standard model ID to an inference profile ID if possible.
-        
+
         Args:
             model_id: The model ID to convert
-            
+
         Returns:
             The inference profile ID if available, otherwise the original model ID
         """
@@ -168,33 +196,33 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             else:
                 logger.warning(f"Unknown inference profile: {model_id}, will use as provided")
                 return model_id
-                
+
         # Try to find a matching inference profile
         base_model_name = model_id.split(":")[0] if ":" in model_id else model_id
-        
+
         for profile in self.INFERENCE_PROFILES:
             # Check if the profile contains the base model name
             if base_model_name in profile:
                 logger.info(f"Converting {model_id} to inference profile: {profile}")
                 return profile
-                
+
         # No matching profile found, use the model ID as is
         logger.warning(f"No matching inference profile found for {model_id}, using standard model ID")
         return model_id
 
     def _validate_batch_support(self) -> None:
         """Validate that the model supports batch inference.
-        
+
         Raises:
             ValueError: If the model does not support batch inference
         """
         # Skip validation for inference profiles as they're designed for distribution
         if self.model_id.startswith("us."):
             return
-            
+
         # Check if the model is in the list of supported models
         model_base = self.model_id.split(":")[0] if ":" in self.model_id else self.model_id
-        
+
         if not any(model_base in supported_model for supported_model in self.BATCH_SUPPORTED_MODELS):
             # Try checking with the AWS Bedrock API to see if the model is batch-enabled
             try:
@@ -205,22 +233,22 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     logger.warning(f"Model {self.model_id} may not support batch inference according to AWS API")
             except Exception as e:
                 logger.warning(f"Could not verify batch support via AWS API: {str(e)}")
-            
+
             logger.warning(f"Model {self.model_id} is not in the list of known batch-supported models")
             logger.warning("This may still work if AWS has recently added batch support for this model")
 
     def _determine_model_provider(self) -> str:
         """Determine the model provider based on the model ID.
-        
+
         Returns:
             The model provider as a string
         """
         model_id_lower = self.model_id.lower()
-        
+
         # For inference profiles, strip the 'us.' prefix for provider detection
         if model_id_lower.startswith("us."):
             model_id_lower = model_id_lower[3:]
-        
+
         if any(p in model_id_lower for p in ["claude", "anthropic"]):
             return "anthropic"
         elif any(p in model_id_lower for p in ["titan", "amazon", "amazon-titan", "nova"]):
@@ -240,7 +268,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
     @property
     def backend(self) -> str:
         """Return the backend name.
-        
+
         Returns:
             The backend name as a string
         """
@@ -249,7 +277,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
     @property
     def compatible_provider(self) -> str:
         """Return the compatible provider name.
-        
+
         Returns:
             The compatible provider name as a string
         """
@@ -258,60 +286,212 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
     @property
     def max_requests_per_batch(self) -> int:
         """Return the maximum number of requests allowed per batch.
-        
+
         Returns:
             Maximum requests per batch
         """
         # AWS Bedrock has a limit of 10,000 records per batch job
         return 10000
 
-    async def format_request_for_batch(self, generic_request: GenericRequest) -> dict:
-        """Format a generic request for AWS Bedrock batch processing.
-        
-        Args:
-            generic_request: The generic request to format
-            
+    @property
+    def max_bytes_per_batch(self) -> int:
+        """Maximum size in bytes allowed for a single batch.
+
         Returns:
-            Dict containing the formatted request for batch processing
+            Maximum batch size in bytes
         """
+        # AWS Bedrock has a limit of 100 MB per batch job
+        return 100 * 1024 * 1024  # 100 MB
+
+    @property
+    def max_concurrent_batch_operations(self) -> int:
+        """Maximum number of concurrent batch operations.
+
+        Returns:
+            Maximum concurrent operations
+        """
+        # Limit concurrent operations to avoid rate limiting
+        return 5
+
+    def create_api_specific_request_batch(self, generic_request: GenericRequest) -> dict:
+        """Convert generic request to API-specific format.
+
+        Args:
+            generic_request: Standardized request object.
+
+        Returns:
+            dict: API-specific request dictionary formatted for AWS Bedrock.
+        """
+        # Instead of using the async method, implement the logic directly here
         # Format the request based on the model provider
         model_input = {}
-        
+
         if self.model_provider == "anthropic":
             # Claude models
-            if isinstance(generic_request.prompt, list):
-                messages = []
-                for message in generic_request.prompt:
+            messages = []
+
+            # Handle messages field
+            if hasattr(generic_request, 'messages') and generic_request.messages:
+                for message in generic_request.messages:
                     if isinstance(message, dict):
-                        messages.append(message)
-                    else:
+                        # Convert to Anthropic format if needed
+                        role = message.get("role", "user")
+                        content = message.get("content", "")
+
+                        # Handle content based on type
+                        if isinstance(content, list):
+                            # Already in Anthropic format
+                            formatted_content = content
+                        elif isinstance(content, str):
+                            # Convert string to Anthropic format
+                            formatted_content = [{"type": "text", "text": content}]
+                        else:
+                            # Convert other types to string
+                            formatted_content = [{"type": "text", "text": str(content)}]
+
                         messages.append({
-                            "role": "user",
-                            "content": [{"type": "text", "text": message}]
+                            "role": role,
+                            "content": formatted_content
                         })
-            else:
-                messages = [{
-                    "role": "user",
-                    "content": [{"type": "text", "text": generic_request.prompt}]
-                }]
-            
+            # Fallback to prompt field if available
+            elif hasattr(generic_request, 'prompt'):
+                if isinstance(generic_request.prompt, list):
+                    for message in generic_request.prompt:
+                        if isinstance(message, dict):
+                            messages.append(message)
+                        else:
+                            messages.append({
+                                "role": "user",
+                                "content": [{"type": "text", "text": message}]
+                            })
+                else:
+                    messages = [{
+                        "role": "user",
+                        "content": [{"type": "text", "text": generic_request.prompt}]
+                    }]
+
             model_input = {
                 "messages": messages,
                 "anthropic_version": "bedrock-2023-05-31",
                 "max_tokens": generic_request.generation_params.get("max_tokens", 1000)
             }
-            
+
             # Add optional parameters
             for param_name in ["temperature", "top_p", "top_k", "stop_sequences"]:
                 if param_name in generic_request.generation_params:
                     model_input[param_name] = generic_request.generation_params[param_name]
-                    
+
+        # Format in AWS Bedrock batch format
+        # Use task_id if available, otherwise use original_row_idx or a default
+        record_id = getattr(generic_request, 'task_id', None)
+        if record_id is None:
+            record_id = getattr(generic_request, 'original_row_idx', 0)
+
+        return {
+            "recordId": f"{record_id}",
+            "modelInput": model_input
+        }
+
+    async def format_request_for_batch(self, generic_request: GenericRequest) -> dict:
+        """Format a generic request for AWS Bedrock batch processing.
+
+        Args:
+            generic_request: The generic request to format
+
+        Returns:
+            Dict containing the formatted request for batch processing
+        """
+        # Format the request based on the model provider
+        model_input = {}
+
+        if self.model_provider == "anthropic":
+            # Claude models
+            messages = []
+
+            # Handle messages field
+            if hasattr(generic_request, 'messages') and generic_request.messages:
+                for message in generic_request.messages:
+                    if isinstance(message, dict):
+                        # Convert to Anthropic format if needed
+                        role = message.get("role", "user")
+                        content = message.get("content", "")
+
+                        # Handle content based on type
+                        if isinstance(content, list):
+                            # Already in Anthropic format
+                            formatted_content = content
+                        elif isinstance(content, str):
+                            # Convert string to Anthropic format
+                            formatted_content = [{"type": "text", "text": content}]
+                        else:
+                            # Convert other types to string
+                            formatted_content = [{"type": "text", "text": str(content)}]
+
+                        messages.append({
+                            "role": role,
+                            "content": formatted_content
+                        })
+            # Fallback to prompt field if available
+            elif hasattr(generic_request, 'prompt'):
+                if isinstance(generic_request.prompt, list):
+                    for message in generic_request.prompt:
+                        if isinstance(message, dict):
+                            messages.append(message)
+                        else:
+                            messages.append({
+                                "role": "user",
+                                "content": [{"type": "text", "text": message}]
+                            })
+                else:
+                    messages = [{
+                        "role": "user",
+                        "content": [{"type": "text", "text": generic_request.prompt}]
+                    }]
+
+            model_input = {
+                "messages": messages,
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": generic_request.generation_params.get("max_tokens", 1000)
+            }
+
+            # Add optional parameters
+            for param_name in ["temperature", "top_p", "top_k", "stop_sequences"]:
+                if param_name in generic_request.generation_params:
+                    model_input[param_name] = generic_request.generation_params[param_name]
+
         elif self.model_provider == "amazon":
             # Amazon Titan models
             if "embed" in self.model_id.lower():
-                model_input = {
-                    "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt)
-                }
+                # For embedding models, extract text from messages or use prompt
+                if hasattr(generic_request, 'messages') and generic_request.messages:
+                    # Extract text from the last user message
+                    text = ""
+                    for message in reversed(generic_request.messages):
+                        if message.get("role", "") == "user":
+                            content = message.get("content", "")
+                            if isinstance(content, str):
+                                text = content
+                                break
+                            elif isinstance(content, list):
+                                # Extract text from content items
+                                for item in content:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        text = item.get("text", "")
+                                        break
+                                if text:
+                                    break
+
+                    model_input = {
+                        "inputText": text
+                    }
+                elif hasattr(generic_request, 'prompt'):
+                    model_input = {
+                        "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt)
+                    }
+                else:
+                    model_input = {
+                        "inputText": ""
+                    }
             else:
                 # Text generation config
                 text_gen_config = {}
@@ -323,34 +503,85 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 ]:
                     if param_name in generic_request.generation_params:
                         text_gen_config[bedrock_name] = generic_request.generation_params[param_name]
-                
-                model_input = {
-                    "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt),
-                    "textGenerationConfig": text_gen_config
-                }
-                
+
+                # Extract text from messages or use prompt
+                if hasattr(generic_request, 'messages') and generic_request.messages:
+                    # Combine all user messages
+                    text = ""
+                    for message in generic_request.messages:
+                        if message.get("role", "") == "user":
+                            content = message.get("content", "")
+                            if isinstance(content, str):
+                                text += content + "\n"
+                            elif isinstance(content, list):
+                                # Extract text from content items
+                                for item in content:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        text += item.get("text", "") + "\n"
+
+                    model_input = {
+                        "inputText": text.strip(),
+                        "textGenerationConfig": text_gen_config
+                    }
+                elif hasattr(generic_request, 'prompt'):
+                    model_input = {
+                        "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt),
+                        "textGenerationConfig": text_gen_config
+                    }
+                else:
+                    model_input = {
+                        "inputText": "",
+                        "textGenerationConfig": text_gen_config
+                    }
+
         elif self.model_provider == "meta":
             # Meta Llama models
-            if isinstance(generic_request.prompt, list):
-                messages = []
-                for message in generic_request.prompt:
+            messages = []
+
+            # Handle messages field
+            if hasattr(generic_request, 'messages') and generic_request.messages:
+                for message in generic_request.messages:
                     if isinstance(message, dict):
-                        messages.append(message)
-                    else:
-                        messages.append({
-                            "role": "user",
-                            "content": str(message)
-                        })
-            else:
-                messages = [{
-                    "role": "user",
-                    "content": str(generic_request.prompt)
-                }]
-            
+                        role = message.get("role", "user")
+                        content = message.get("content", "")
+
+                        # Handle content based on type
+                        if isinstance(content, list):
+                            # Extract text from content items
+                            text = ""
+                            for item in content:
+                                if isinstance(item, dict) and item.get("type") == "text":
+                                    text += item.get("text", "") + " "
+                            messages.append({
+                                "role": role,
+                                "content": text.strip()
+                            })
+                        else:
+                            messages.append({
+                                "role": role,
+                                "content": str(content)
+                            })
+            # Fallback to prompt field if available
+            elif hasattr(generic_request, 'prompt'):
+                if isinstance(generic_request.prompt, list):
+                    for message in generic_request.prompt:
+                        if isinstance(message, dict):
+                            messages.append(message)
+                        else:
+                            messages.append({
+                                "role": "user",
+                                "content": str(message)
+                            })
+                else:
+                    messages = [{
+                        "role": "user",
+                        "content": str(generic_request.prompt)
+                    }]
+
             model_input = {
                 "messages": messages
             }
-            
+
             # Add optional parameters
             for param_name, api_name in [
                 ("temperature", "temperature"),
@@ -359,7 +590,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             ]:
                 if param_name in generic_request.generation_params:
                     model_input[api_name] = generic_request.generation_params[param_name]
-                    
+
         elif self.model_provider == "cohere":
             # Cohere models
             if "embed" in self.model_id.lower():
@@ -380,7 +611,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                         else:
                             role = "USER" if len(chat_history) % 2 == 0 else "CHATBOT"
                             chat_history.append({"role": role, "message": str(message)})
-                    
+
                     last_message = generic_request.prompt[-1]
                     if isinstance(last_message, dict):
                         query = last_message.get("content", "")
@@ -389,7 +620,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 else:
                     query = generic_request.prompt
                     chat_history = []
-                
+
                 model_input = {
                     "message": query,
                     "chat_history": chat_history
@@ -399,11 +630,11 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 prompt = generic_request.prompt
                 if isinstance(prompt, list):
                     prompt = "\n".join([str(p) for p in prompt])
-                
+
                 model_input = {
                     "prompt": prompt
                 }
-            
+
             # Add optional parameters
             param_mapping = {
                 "temperature": "temperature",
@@ -412,11 +643,11 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 "max_tokens": "max_tokens",
                 "stop_sequences": "stop_sequences"
             }
-            
+
             for param_name, api_name in param_mapping.items():
                 if param_name in generic_request.generation_params:
                     model_input[api_name] = generic_request.generation_params[param_name]
-                    
+
         elif self.model_provider == "ai21":
             # AI21 models
             if "jamba" in self.model_id.lower():
@@ -436,7 +667,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                         "role": "user",
                         "content": str(generic_request.prompt)
                     }]
-                
+
                 model_input = {
                     "messages": messages
                 }
@@ -445,18 +676,18 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 prompt = generic_request.prompt
                 if isinstance(prompt, list):
                     prompt = "\n".join([str(p) for p in prompt])
-                
+
                 model_input = {
                     "prompt": prompt
                 }
-                
+
                 # Add penalty parameters
                 for penalty in ["countPenalty", "presencePenalty", "frequencyPenalty"]:
                     if penalty in generic_request.generation_params:
                         model_input[penalty] = {
                             "scale": generic_request.generation_params[penalty]
                         }
-            
+
             # Add optional parameters
             param_mapping = {
                 "temperature": "temperature",
@@ -464,11 +695,11 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 "max_tokens": "maxTokens" if "jamba" not in self.model_id.lower() else "max_tokens",
                 "stop_sequences": "stopSequences" if "jamba" not in self.model_id.lower() else "stop_sequences"
             }
-            
+
             for param_name, api_name in param_mapping.items():
                 if param_name in generic_request.generation_params:
                     model_input[api_name] = generic_request.generation_params[param_name]
-                    
+
         elif self.model_provider == "mistral":
             # Mistral AI models
             if isinstance(generic_request.prompt, list):
@@ -486,215 +717,185 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     "role": "user",
                     "content": str(generic_request.prompt)
                 }]
-            
+
             model_input = {
                 "messages": messages
             }
-            
+
             # Add optional parameters
             for param_name in ["temperature", "top_p", "max_tokens"]:
                 if param_name in generic_request.generation_params:
                     model_input[param_name] = generic_request.generation_params[param_name]
         else:
             raise ValueError(f"Unsupported model provider: {self.model_provider}")
-        
+
         # Format in AWS Bedrock batch format
+        # Use task_id if available, otherwise use original_row_idx or a default
+        record_id = getattr(generic_request, 'task_id', None)
+        if record_id is None:
+            record_id = getattr(generic_request, 'original_row_idx', 0)
+
         return {
-            "recordId": f"{generic_request.task_id}",
+            "recordId": f"{record_id}",
             "modelInput": model_input
         }
 
-    async def submit_batch(self, batch: GenericBatch) -> None:
-        """Submit a batch to AWS Bedrock.
-        
+    async def submit_batch(self, requests: list[dict], metadata: dict) -> GenericBatch:
+        """Submit a batch of requests to AWS Bedrock.
+
         Args:
-            batch: The batch to submit
-            
+            requests: List of API-specific request dictionaries
+            metadata: Metadata to associate with the batch
+
+        Returns:
+            GenericBatch: The created batch object
+
         Raises:
             Exception: If batch submission fails
         """
-        # Create batch input file in JSONL format
-        batch_file_path = Path(self.working_dir) / f"{batch.batch_id}_input.jsonl"
-        
-        try:
-            # Format requests for batch processing
-            async with aiofiles.open(batch_file_path, "w") as f:
-                for i, request in enumerate(batch.requests):
-                    request_json = await self.format_request_for_batch(request)
-                    await f.write(json.dumps(request_json) + "\n")
-            
-            logger.info(f"Created batch file with {len(batch.requests)} requests at {batch_file_path}")
-            
-            # Upload batch file to S3
-            input_s3_key = f"{self.s3_prefix}/input/{batch.batch_id}_input.jsonl"
-            await asyncio.to_thread(
-                self.s3.upload_file, 
-                str(batch_file_path), 
-                self.s3_bucket, 
-                input_s3_key
-            )
-            
-            logger.info(f"Uploaded batch file to s3://{self.s3_bucket}/{input_s3_key}")
-            
-            # Set up S3 locations for input and output
-            s3_input_uri = f"s3://{self.s3_bucket}/{input_s3_key}"
-            s3_output_uri = f"s3://{self.s3_bucket}/{self.s3_prefix}/output/{batch.batch_id}"
-            
-            # Create batch job in AWS Bedrock
-            job_response = await asyncio.to_thread(
-                self.bedrock.create_model_invocation_job,
-                jobName=f"curator-batch-{batch.batch_id}",
-                modelId=self.model_id,
-                roleArn=self.role_arn,
-                inputDataConfig={
-                    "s3InputDataConfig": {
-                        "s3Uri": s3_input_uri
-                    }
-                },
-                outputDataConfig={
-                    "s3OutputDataConfig": {
-                        "s3Uri": s3_output_uri
-                    }
-                },
-                timeoutDurationInHours=self.timeout_hours
-            )
-            
-            # Store job details
-            job_id = job_response.get("jobArn").split("/")[-1]
-            
-            logger.info(f"Submitted batch job {job_id} for batch {batch.batch_id}")
-            
-            # Update batch with job details
-            batch.provider_batch_id = job_id
-            batch.status = GenericBatchStatus.PROCESSING
-            batch.metadata = {
-                "job_id": job_id,
-                "job_arn": job_response.get("jobArn"),
-                "model_id": self.model_id,
-                "using_inference_profile": self.use_inference_profile,
-                "s3_input_uri": s3_input_uri,
-                "s3_output_uri": s3_output_uri,
-                "submission_time": datetime.datetime.now().isoformat()
-            }
-            
-            self.batch_jobs[batch.batch_id] = {
-                "job_id": job_id,
-                "input_s3_key": input_s3_key,
-                "output_s3_uri": s3_output_uri,
-                "batch_file_path": str(batch_file_path)
-            }
-            
-            # Update batch status in tracker file
-            await self.tracker.append_batch(batch)
-            
-        except Exception as e:
-            logger.error(f"Failed to submit batch {batch.batch_id}: {str(e)}")
-            batch.status = GenericBatchStatus.FAILED
-            batch.metadata = {"error": str(e)}
-            await self.tracker.append_batch(batch)
-            raise Exception(f"Failed to submit batch: {str(e)}")
+        async with self.semaphore:
+            # Generate a unique batch ID
+            batch_id = f"bedrock-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            request_file = metadata.get("request_file")
 
-    async def check_batch_status(self, batch: GenericBatch) -> GenericBatchStatus:
-        """Check the status of a batch job in AWS Bedrock.
-        
-        Args:
-            batch: The batch to check
-            
-        Returns:
-            Updated batch status
-        """
-        if not batch.provider_batch_id:
-            logger.error(f"Batch {batch.batch_id} has no provider batch ID")
-            return GenericBatchStatus.FAILED
-        
-        try:
-            response = await asyncio.to_thread(
-                self.bedrock.get_model_invocation_job,
-                jobIdentifier=batch.provider_batch_id
-            )
-            
-            # Map AWS Bedrock status to GenericBatchStatus
-            bedrock_status = response.get("status")
-            
-            status_mapping = {
-                "Submitted": GenericBatchStatus.PROCESSING,
-                "InProgress": GenericBatchStatus.PROCESSING,
-                "Completed": GenericBatchStatus.COMPLETE,
-                "Failed": GenericBatchStatus.FAILED,
-                "Stopping": GenericBatchStatus.PROCESSING,
-                "Stopped": GenericBatchStatus.FAILED,
-                "Expired": GenericBatchStatus.FAILED
-            }
-            
-            # Update batch metadata with latest status
-            if "metadata" not in batch or not isinstance(batch.metadata, dict):
-                batch.metadata = {}
-            
-            batch.metadata.update({
-                "bedrock_status": bedrock_status,
-                "last_checked": datetime.datetime.now().isoformat()
-            })
-            
-            # Handle failure messages
-            if bedrock_status in ["Failed", "Stopped", "Expired"]:
-                if "failureMessage" in response:
-                    batch.metadata["failure_reason"] = response.get("failureMessage")
-                    logger.error(f"Batch {batch.batch_id} failed: {response.get('failureMessage')}")
-            
-            # Return mapped status
-            return status_mapping.get(bedrock_status, GenericBatchStatus.PROCESSING)
-            
-        except Exception as e:
-            logger.error(f"Error checking batch {batch.batch_id} status: {str(e)}")
-            return batch.status  # Preserve current status on error
+            # Create batch input file in JSONL format
+            batch_file_path = Path(self.working_dir) / f"{batch_id}_input.jsonl"
+
+            try:
+                # Write requests to batch file
+                async with aiofiles.open(batch_file_path, "w") as f:
+                    for request in requests:
+                        await f.write(json.dumps(request) + "\n")
+
+                logger.info(f"Created batch file with {len(requests)} requests at {batch_file_path}")
+
+                # Upload batch file to S3
+                input_s3_key = f"{self.s3_prefix}/input/{batch_id}_input.jsonl"
+                await asyncio.to_thread(
+                    self.s3.upload_file,
+                    str(batch_file_path),
+                    self.s3_bucket,
+                    input_s3_key
+                )
+
+                logger.info(f"Uploaded batch file to s3://{self.s3_bucket}/{input_s3_key}")
+
+                # Set up S3 locations for input and output
+                s3_input_uri = f"s3://{self.s3_bucket}/{input_s3_key}"
+                s3_output_uri = f"s3://{self.s3_bucket}/{self.s3_prefix}/output/{batch_id}/"
+
+                # Create batch job in AWS Bedrock
+                job_response = await asyncio.to_thread(
+                    self.bedrock.create_model_invocation_job,
+                    jobName=f"curator-batch-{batch_id}",
+                    modelId=self.model_id,
+                    roleArn=self.role_arn,
+                    inputDataConfig={
+                        "s3InputDataConfig": {
+                            "s3Uri": s3_input_uri
+                        }
+                    },
+                    outputDataConfig={
+                        "s3OutputDataConfig": {
+                            "s3Uri": s3_output_uri
+                        }
+                    },
+                    timeoutDurationInHours=self.timeout_hours
+                )
+
+                # Store job details
+                job_id = job_response.get("jobArn").split("/")[-1]
+
+                logger.info(f"Submitted batch job {job_id} for batch {batch_id}")
+
+                # Create a GenericBatch object
+                batch = GenericBatch(
+                    batch_id=batch_id,
+                    id=batch_id,  # Use the same ID for both fields
+                    provider_batch_id=job_id,
+                    status=GenericBatchStatus.PROCESSING,
+                    request_file=request_file,
+                    metadata={
+                        "job_id": job_id,
+                        "job_arn": job_response.get("jobArn"),
+                        "model_id": self.model_id,
+                        "using_inference_profile": self.use_inference_profile,
+                        "s3_input_uri": s3_input_uri,
+                        "s3_output_uri": s3_output_uri,
+                        "submission_time": datetime.datetime.now().isoformat(),
+                        "num_requests": len(requests)
+                    },
+                    request_counts=GenericBatchRequestCounts(
+                        total=len(requests),
+                        succeeded=0,
+                        failed=0,
+                        raw_request_counts_object={"total": len(requests), "succeeded": 0, "failed": 0}
+                    )
+                )
+
+                # Store batch job info for later reference
+                self.batch_jobs[batch_id] = {
+                    "job_id": job_id,
+                    "input_s3_key": input_s3_key,
+                    "output_s3_uri": s3_output_uri,
+                    "batch_file_path": str(batch_file_path)
+                }
+
+                return batch
+
+            except Exception as e:
+                logger.error(f"Failed to submit batch: {str(e)}")
+                raise Exception(f"Failed to submit batch: {str(e)}")
+
+
 
     async def fetch_batch_results(self, batch: GenericBatch) -> t.List[GenericResponse]:
         """Fetch results for a completed batch job from AWS Bedrock.
-        
+
         Args:
             batch: The completed batch to fetch results for
-            
+
         Returns:
             List of GenericResponse objects
-            
+
         Raises:
             Exception: If result fetching fails
         """
         if batch.status != GenericBatchStatus.COMPLETE:
             raise ValueError(f"Cannot fetch results for batch {batch.batch_id} with status {batch.status}")
-        
+
         if not batch.provider_batch_id or "metadata" not in batch or not isinstance(batch.metadata, dict):
             raise ValueError(f"Batch {batch.batch_id} has missing provider ID or metadata")
-        
+
         # Get output S3 URI from metadata
         output_s3_uri = batch.metadata.get("s3_output_uri")
         if not output_s3_uri:
             raise ValueError(f"Batch {batch.batch_id} has no output S3 URI in metadata")
-        
+
         try:
             # Parse S3 URI
             parsed_uri = urlparse(output_s3_uri)
             bucket = parsed_uri.netloc
             prefix = parsed_uri.path.lstrip("/")
-            
+
             # List objects in output location
             response = await asyncio.to_thread(
                 self.s3.list_objects_v2,
                 Bucket=bucket,
                 Prefix=prefix
             )
-            
+
             # Create a mapping from record ID to response
             responses_by_id = {}
-            
+
             # Process all output files
             for obj in response.get("Contents", []):
                 key = obj["Key"]
-                
+
                 # Skip any non-response files (e.g., manifests)
                 if not key.endswith(".jsonl.out"):
                     continue
-                
+
                 # Download and process response file
                 output_file_path = Path(self.working_dir) / f"{batch.batch_id}_output_{Path(key).name}"
                 await asyncio.to_thread(
@@ -703,7 +904,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     key,
                     str(output_file_path)
                 )
-                
+
                 # Parse response file
                 async with aiofiles.open(output_file_path, "r") as f:
                     content = await f.read()
@@ -715,13 +916,13 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                                 responses_by_id[record_id] = response_json
                         except json.JSONDecodeError:
                             logger.warning(f"Invalid JSON in response file {key}: {line}")
-            
+
             # Convert to GenericResponse objects
             responses = []
             for request in batch.requests:
                 record_id = str(request.task_id)
                 response_json = responses_by_id.get(record_id)
-                
+
                 if not response_json:
                     # Missing response
                     responses.append(GenericResponse(
@@ -734,13 +935,13 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                         token_usage=_TokenUsage(input_tokens=0, output_tokens=0)
                     ))
                     continue
-                
+
                 # Extract model output from response
                 model_output = response_json.get("modelOutput", {})
-                
+
                 # Process based on model provider
                 text_response, token_usage = self._extract_response_from_batch(model_output, request)
-                
+
                 # Create generic response
                 responses.append(GenericResponse(
                     task_id=request.task_id,
@@ -752,20 +953,20 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     raw_data=model_output,
                     token_usage=token_usage
                 ))
-            
+
             return responses
-                
+
         except Exception as e:
             logger.error(f"Error fetching results for batch {batch.batch_id}: {str(e)}")
             raise Exception(f"Failed to fetch batch results: {str(e)}")
 
     def _extract_response_from_batch(self, model_output: dict, request: GenericRequest) -> t.Tuple[str, _TokenUsage]:
         """Extract response text and token usage from model output.
-        
+
         Args:
             model_output: The raw model output from batch processing
             request: The original request for context
-            
+
         Returns:
             Tuple of (text_response, token_usage)
         """
@@ -773,7 +974,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         text_response = ""
         input_tokens = 0
         output_tokens = 0
-        
+
         # Extract based on model provider
         if self.model_provider == "anthropic":
             # Claude models
@@ -781,12 +982,12 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 for content_item in model_output.get("content", []):
                     if content_item.get("type") == "text":
                         text_response = content_item.get("text", "")
-            
+
             # Get token usage
             usage = model_output.get("usage", {})
             input_tokens = usage.get("input_tokens", 0)
             output_tokens = usage.get("output_tokens", 0)
-            
+
         elif self.model_provider == "amazon":
             # Amazon Titan models
             if "embed" in self.model_id.lower():
@@ -799,13 +1000,13 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 text_response = model_output.get("results", [{}])[0].get("outputText", "")
                 input_tokens = model_output.get("inputTextTokenCount", 0)
                 output_tokens = model_output.get("results", [{}])[0].get("tokenCount", 0)
-                
+
         elif self.model_provider == "meta":
             # Meta Llama models
             text_response = model_output.get("generation", "")
             input_tokens = model_output.get("prompt_token_count", 0)
             output_tokens = model_output.get("generation_token_count", 0)
-            
+
         elif self.model_provider == "cohere":
             # Cohere models
             if "embed" in self.model_id.lower():
@@ -825,7 +1026,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 # Rough token estimate
                 input_tokens = len(str(request.prompt)) // 4
                 output_tokens = len(text_response) // 4
-                
+
         elif self.model_provider == "ai21":
             # AI21 models
             if "jamba" in self.model_id.lower():
@@ -839,30 +1040,30 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 # Rough token estimate
                 input_tokens = len(str(request.prompt)) // 4
                 output_tokens = len(text_response) // 4
-                
+
         elif self.model_provider == "mistral":
             # Mistral AI models
             choices = model_output.get("choices", [{}])
             if choices:
                 message = choices[0].get("message", {})
                 text_response = message.get("content", "")
-            
+
             # Get token usage
             usage = model_output.get("usage", {})
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
-            
+
         else:
             raise ValueError(f"Unsupported model provider: {self.model_provider}")
-        
+
         # Create token usage object
         token_usage = _TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
-        
+
         return text_response, token_usage
 
     async def cleanup_batch(self, batch: GenericBatch) -> None:
         """Clean up resources for a batch job.
-        
+
         Args:
             batch: The batch to clean up
         """
@@ -870,20 +1071,20 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         if batch.batch_id in self.batch_jobs:
             job_info = self.batch_jobs[batch.batch_id]
             batch_file_path = job_info.get("batch_file_path")
-            
+
             if batch_file_path and os.path.exists(batch_file_path):
                 try:
-                    if (batch.status == GenericBatchStatus.COMPLETE and 
+                    if (batch.status == GenericBatchStatus.COMPLETE and
                         getattr(self.config, "delete_successful_batch_files", False)):
                         os.remove(batch_file_path)
                         logger.info(f"Deleted successful batch input file: {batch_file_path}")
-                    elif (batch.status == GenericBatchStatus.FAILED and 
+                    elif (batch.status == GenericBatchStatus.FAILED and
                           getattr(self.config, "delete_failed_batch_files", False)):
                         os.remove(batch_file_path)
                         logger.info(f"Deleted failed batch input file: {batch_file_path}")
                 except Exception as e:
                     logger.warning(f"Failed to delete batch file {batch_file_path}: {str(e)}")
-            
+
             # Clean up S3 files
             if getattr(self.config, "delete_successful_batch_files", False) and batch.status == GenericBatchStatus.COMPLETE:
                 try:
@@ -896,67 +1097,362 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                             Key=input_s3_key
                         )
                         logger.info(f"Deleted S3 input file: s3://{self.s3_bucket}/{input_s3_key}")
-                    
+
                     # Delete output files from S3
                     output_s3_uri = job_info.get("output_s3_uri")
                     if output_s3_uri:
                         parsed_uri = urlparse(output_s3_uri)
                         prefix = parsed_uri.path.lstrip("/")
-                        
+
                         # List and delete output objects
                         response = await asyncio.to_thread(
                             self.s3.list_objects_v2,
                             Bucket=self.s3_bucket,
                             Prefix=prefix
                         )
-                        
+
                         for obj in response.get("Contents", []):
                             await asyncio.to_thread(
                                 self.s3.delete_object,
                                 Bucket=self.s3_bucket,
                                 Key=obj["Key"]
                             )
-                        
+
                         logger.info(f"Deleted S3 output files: {output_s3_uri}")
                 except Exception as e:
                     logger.warning(f"Failed to delete S3 files for batch {batch.batch_id}: {str(e)}")
-            
+
             # Remove batch from tracking
             self.batch_jobs.pop(batch.batch_id, None)
 
-    async def cancel_batch(self, batch: GenericBatch) -> None:
+    async def retrieve_batch(self, batch: GenericBatch) -> GenericBatch:
+        """Retrieve current status of a submitted batch.
+
+        Args:
+            batch: The batch object to check status for.
+
+        Returns:
+            GenericBatch: Updated batch object with current status.
+            None: If the batch is not found or inaccessible.
+        """
+        async with self.semaphore:
+            if not batch.provider_batch_id:
+                logger.warning(f"Batch {batch.batch_id} has no provider batch ID")
+                return None
+
+            try:
+                # Get the batch status from AWS Bedrock
+                response = await asyncio.to_thread(
+                    self.bedrock.get_model_invocation_job,
+                    jobIdentifier=batch.provider_batch_id
+                )
+
+                # Map AWS Bedrock status to GenericBatchStatus
+                bedrock_status = response.get("status")
+
+                status_mapping = {
+                    "Submitted": GenericBatchStatus.PROCESSING,
+                    "InProgress": GenericBatchStatus.PROCESSING,
+                    "Completed": GenericBatchStatus.COMPLETE,
+                    "Failed": GenericBatchStatus.FAILED,
+                    "Stopping": GenericBatchStatus.PROCESSING,
+                    "Stopped": GenericBatchStatus.FAILED,
+                    "Expired": GenericBatchStatus.FAILED
+                }
+
+                # Update batch with latest status
+                batch.status = status_mapping.get(bedrock_status, GenericBatchStatus.PROCESSING)
+
+                # Update metadata
+                if not batch.metadata:
+                    batch.metadata = {}
+
+                batch.metadata.update({
+                    "bedrock_status": bedrock_status,
+                    "last_checked": datetime.datetime.now().isoformat()
+                })
+
+                # Add failure reason if available
+                if bedrock_status in ["Failed", "Stopped", "Expired"] and "failureMessage" in response:
+                    batch.metadata["failure_reason"] = response.get("failureMessage")
+                    logger.error(f"Batch {batch.batch_id} failed: {response.get('failureMessage')}")
+
+                return batch
+
+            except Exception as e:
+                logger.warning(f"Error retrieving batch {batch.batch_id}: {str(e)}")
+                return None
+
+    async def download_batch(self, batch: GenericBatch) -> list[dict] | None:
+        """Download results of a completed batch.
+
+        Args:
+            batch: The completed batch object to download.
+
+        Returns:
+            list[dict] | None: List of response dictionaries if successful, None if download fails.
+        """
+        async with self.semaphore:
+            if batch.status != GenericBatchStatus.COMPLETE:
+                logger.warning(f"Cannot download batch {batch.batch_id} with status {batch.status}")
+                return None
+
+            if not batch.provider_batch_id or not batch.metadata or not isinstance(batch.metadata, dict):
+                logger.warning(f"Batch {batch.batch_id} has missing provider ID or metadata")
+                return None
+
+            # Get output S3 URI from metadata
+            output_s3_uri = batch.metadata.get("s3_output_uri")
+            if not output_s3_uri:
+                logger.warning(f"Batch {batch.batch_id} has no output S3 URI in metadata")
+                return None
+
+            try:
+                # Parse S3 URI
+                parsed_uri = urlparse(output_s3_uri)
+                bucket = parsed_uri.netloc
+                prefix = parsed_uri.path.lstrip("/")
+
+                # List objects in output location
+                response = await asyncio.to_thread(
+                    self.s3.list_objects_v2,
+                    Bucket=bucket,
+                    Prefix=prefix
+                )
+
+                # Process all output files
+                responses = []
+
+                for obj in response.get("Contents", []):
+                    key = obj["Key"]
+
+                    # Skip any non-response files (e.g., manifests)
+                    if not key.endswith(".jsonl.out"):
+                        continue
+
+                    # Download and process response file
+                    output_file_path = Path(self.working_dir) / f"{batch.batch_id}_output_{Path(key).name}"
+                    await asyncio.to_thread(
+                        self.s3.download_file,
+                        bucket,
+                        key,
+                        str(output_file_path)
+                    )
+
+                    # Parse response file
+                    async with aiofiles.open(output_file_path, "r") as f:
+                        content = await f.read()
+                        for line in content.splitlines():
+                            try:
+                                response_json = json.loads(line)
+                                responses.append(response_json)
+                            except json.JSONDecodeError:
+                                logger.warning(f"Invalid JSON in response file {key}: {line}")
+
+                return responses
+
+            except Exception as e:
+                logger.error(f"Error downloading batch {batch.batch_id}: {str(e)}")
+                return None
+
+    def parse_api_specific_response(
+        self,
+        raw_response: dict,
+        generic_request: GenericRequest,
+        batch: GenericBatch,
+    ) -> GenericResponse:
+        """Parse API-specific response into standardized format.
+
+        Args:
+            raw_response: Raw response dictionary from API.
+            generic_request: Original generic request object.
+            batch: Batch object containing context information.
+
+        Returns:
+            GenericResponse: Standardized response object.
+        """
+        # Extract model output
+        model_output = raw_response.get("modelOutput", {})
+
+        # Process based on model provider
+        text_response, token_usage = self._extract_response_from_batch(model_output, generic_request)
+
+        # Create generic response
+        return GenericResponse(
+            task_id=generic_request.task_id,
+            response=text_response,
+            success=True if text_response else False,
+            finish_reason="stop" if text_response else "error",
+            message="Success" if text_response else "Failed to extract response",
+            processing_time=0,  # Batch jobs don't provide per-request timing
+            raw_data=model_output,
+            raw_response=raw_response,
+            generic_request=generic_request,
+            token_usage=token_usage,
+            created_at=datetime.datetime.fromisoformat(batch.metadata.get("submission_time", datetime.datetime.now().isoformat())),
+            finished_at=datetime.datetime.now()
+        )
+
+    def parse_api_specific_batch_object(self, batch: object, request_file: str | None = None) -> GenericBatch:
+        """Convert API-specific batch object to generic format.
+
+        Args:
+            batch: API-specific batch object (AWS Bedrock job response).
+            request_file: Optional path to associated request file.
+
+        Returns:
+            GenericBatch: Standardized batch object.
+        """
+        # For AWS Bedrock, the batch object is a dictionary from the get_model_invocation_job API
+        if isinstance(batch, dict):
+            # Extract job ID from ARN
+            job_arn = batch.get("jobArn", "")
+            job_id = job_arn.split("/")[-1] if "/" in job_arn else job_arn
+
+            # Map status
+            bedrock_status = batch.get("status")
+            status_mapping = {
+                "Submitted": GenericBatchStatus.PROCESSING,
+                "InProgress": GenericBatchStatus.PROCESSING,
+                "Completed": GenericBatchStatus.COMPLETE,
+                "Failed": GenericBatchStatus.FAILED,
+                "Stopping": GenericBatchStatus.PROCESSING,
+                "Stopped": GenericBatchStatus.FAILED,
+                "Expired": GenericBatchStatus.FAILED
+            }
+            status = status_mapping.get(bedrock_status, GenericBatchStatus.PROCESSING)
+
+            # Extract S3 URIs
+            input_data_config = batch.get("inputDataConfig", {}).get("s3InputDataConfig", {})
+            output_data_config = batch.get("outputDataConfig", {}).get("s3OutputDataConfig", {})
+
+            s3_input_uri = input_data_config.get("s3Uri")
+            s3_output_uri = output_data_config.get("s3Uri")
+
+            # Create batch ID from job name or ID
+            batch_id = batch.get("jobName", "").replace("curator-batch-", "") or job_id
+
+            # Create metadata
+            metadata = {
+                "job_id": job_id,
+                "job_arn": job_arn,
+                "model_id": batch.get("modelId"),
+                "s3_input_uri": s3_input_uri,
+                "s3_output_uri": s3_output_uri,
+                "bedrock_status": bedrock_status,
+                "submission_time": batch.get("creationTime", datetime.datetime.now()).isoformat() if hasattr(batch.get("creationTime", None), "isoformat") else datetime.datetime.now().isoformat(),
+                "last_checked": datetime.datetime.now().isoformat()
+            }
+
+            # Add failure reason if available
+            if bedrock_status in ["Failed", "Stopped", "Expired"] and "failureMessage" in batch:
+                metadata["failure_reason"] = batch.get("failureMessage")
+
+            return GenericBatch(
+                batch_id=batch_id,
+                id=batch_id,
+                provider_batch_id=job_id,
+                status=status,
+                request_file=request_file,
+                metadata=metadata
+            )
+        else:
+            # If not a dict, assume it's already a GenericBatch
+            return batch
+
+    def parse_api_specific_request_counts(self, request_counts: object, request_file: str | None = None) -> GenericBatchRequestCounts:  # noqa: ARG002
+        """Convert API-specific request counts to generic format.
+
+        Args:
+            request_counts: API-specific request count object.
+            request_file: Path to associated request file.
+
+        Returns:
+            GenericBatchRequestCounts: Standardized request count object.
+        """
+        # AWS Bedrock doesn't provide detailed request counts during processing
+        # We can only estimate based on the batch status
+
+        # Count the number of requests in the file if available
+        total_from_file = 0
+        if request_file and os.path.exists(request_file):
+            with open(request_file, 'r') as f:
+                total_from_file = sum(1 for _ in f)
+
+        if isinstance(request_counts, dict):
+            # If we have a job response, extract what we can
+            total = request_counts.get("total", total_from_file)
+            succeeded = request_counts.get("succeeded", 0)
+            failed = request_counts.get("failed", 0)
+            pending = total - (succeeded + failed)
+
+            return GenericBatchRequestCounts(
+                total=total,
+                succeeded=succeeded,
+                failed=failed,
+                pending=pending,
+                raw_request_counts_object=request_counts
+            )
+        elif isinstance(request_counts, int):
+            # If we just have a total count
+            total = request_counts or total_from_file
+            return GenericBatchRequestCounts(
+                total=total,
+                succeeded=0,
+                failed=0,
+                pending=total,
+                raw_request_counts_object={"total": total}
+            )
+        else:
+            # Default to using file count or empty counts
+            total = total_from_file
+            return GenericBatchRequestCounts(
+                total=total,
+                succeeded=0,
+                failed=0,
+                pending=total,
+                raw_request_counts_object={"total": total}
+            )
+
+    async def cancel_batch(self, batch: GenericBatch) -> GenericBatch:
         """Cancel a batch job in AWS Bedrock.
-        
+
         Args:
             batch: The batch to cancel
-            
+
+        Returns:
+            GenericBatch: Updated batch object after cancellation
+
         Raises:
             Exception: If cancellation fails
         """
-        if not batch.provider_batch_id:
-            logger.error(f"Batch {batch.batch_id} has no provider batch ID")
-            return
-        
-        try:
-            # Stop the batch job
-            await asyncio.to_thread(
-                self.bedrock.stop_model_invocation_job,
-                jobIdentifier=batch.provider_batch_id
-            )
-            
-            logger.info(f"Cancelled batch job {batch.provider_batch_id} for batch {batch.batch_id}")
-            
-            # Update batch status
-            batch.status = GenericBatchStatus.FAILED
-            batch.metadata = batch.metadata or {}
-            batch.metadata.update({
-                "cancelled": True,
-                "cancelled_time": datetime.datetime.now().isoformat()
-            })
-            
-            # Clean up resources
-            await self.cleanup_batch(batch)
-            
-        except Exception as e:
-            logger.error(f"Failed to cancel batch {batch.batch_id}: {str(e)}")
-            raise Exception(f"Failed to cancel batch: {str(e)}") 
+        async with self.semaphore:
+            if not batch.provider_batch_id:
+                logger.error(f"Batch {batch.batch_id} has no provider batch ID")
+                return batch
+
+            try:
+                # Stop the batch job
+                await asyncio.to_thread(
+                    self.bedrock.stop_model_invocation_job,
+                    jobIdentifier=batch.provider_batch_id
+                )
+
+                logger.info(f"Cancelled batch job {batch.provider_batch_id} for batch {batch.batch_id}")
+
+                # Update batch status
+                batch.status = GenericBatchStatus.FAILED
+                batch.metadata = batch.metadata or {}
+                batch.metadata.update({
+                    "cancelled": True,
+                    "cancelled_time": datetime.datetime.now().isoformat()
+                })
+
+                # Clean up resources
+                await self.cleanup_batch(batch)
+
+                return batch
+
+            except Exception as e:
+                logger.error(f"Failed to cancel batch {batch.batch_id}: {str(e)}")
+                raise Exception(f"Failed to cancel batch: {str(e)}")
