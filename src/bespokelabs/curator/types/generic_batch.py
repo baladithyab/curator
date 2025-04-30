@@ -11,7 +11,10 @@ class GenericBatchStatus(Enum):
     """Status of a generic batch request."""
 
     SUBMITTED = "submitted"  # Batch has been submitted but not yet processed
-    FINISHED = "finished"  # Batch processing has completed
+    PROCESSING = "processing"  # Batch is being processed
+    COMPLETE = "complete"  # Batch processing has completed successfully
+    FAILED = "failed"  # Batch processing has failed
+    FINISHED = "finished"  # Batch processing has completed (success or failure)
     DOWNLOADED = "downloaded"  # Results have been downloaded
 
 
@@ -27,15 +30,19 @@ class GenericBatchRequestCounts(BaseModel):
 class GenericBatch(BaseModel):
     """Represents a batch of requests sent to an API."""
 
-    request_file: str  # Path to the file containing the requests
-    id: str  # Unique identifier for this batch
-    created_at: datetime.datetime  # When the batch was created
-    finished_at: Optional[datetime.datetime]  # When processing completed, if finished
+    batch_id: str  # Unique identifier for this batch
+    id: str  # API-specific identifier (may be the same as batch_id)
+    provider_batch_id: Optional[str] = None  # Provider-specific batch ID
+    request_file: Optional[str] = None  # Path to the file containing the requests
     status: str  # Current status of the batch
-    api_key_suffix: str  # Last few characters of the API key used
-    request_counts: GenericBatchRequestCounts  # Statistics about the requests
-    raw_status: str  # Raw status string from the API
-    raw_batch: dict  # Complete raw batch data from the API
+    created_at: Optional[datetime.datetime] = None  # When the batch was created
+    finished_at: Optional[datetime.datetime] = None  # When processing completed, if finished
+    metadata: Optional[dict] = None  # Additional metadata about the batch
+    requests: Optional[list] = None  # List of requests in the batch
+    api_key_suffix: Optional[str] = None  # Last few characters of the API key used
+    request_counts: Optional[GenericBatchRequestCounts] = None  # Statistics about the requests
+    raw_status: Optional[str] = None  # Raw status string from the API
+    raw_batch: Optional[dict] = None  # Complete raw batch data from the API
     attempts_left: int = 1  # Number of attempts left to download the results
     resubmitted: bool = False  # Whether the batch has been resubmitted
 
