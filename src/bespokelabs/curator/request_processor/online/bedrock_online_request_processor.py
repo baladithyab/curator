@@ -8,6 +8,7 @@ import asyncio
 import datetime
 import json
 import os
+import random
 import re
 import time
 import typing as t
@@ -121,7 +122,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         enable_metrics: bool = False,
     ):
         """Initialize the BedrockOnlineRequestProcessor.
-        
+
         Args:
             config: Configuration for the request processor
             region_name: AWS region to use for Bedrock API calls
@@ -134,25 +135,31 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         # Initialize shared boto3 session for client reuse
         self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
         self.session = boto3.session.Session(region_name=self.region_name)
-        
+
         # Configure boto3 with performance optimizations
         self.boto_config = boto_config or {}
         default_config = {
-            'retries': {'max_attempts': 3, 'mode': 'standard'},
+            # We'll handle retries ourselves for better control
+            'retries': {'max_attempts': 1, 'mode': 'standard'},
             'connect_timeout': 5,
             'read_timeout': 60,
         }
+
+        # Exponential backoff configuration
+        self.base_delay = getattr(config, "base_delay", 1.0)  # Base delay in seconds
+        self.max_delay = getattr(config, "max_delay", 60.0)  # Maximum delay in seconds
+        self.jitter_factor = getattr(config, "jitter_factor", 0.1)  # Jitter factor (0.0-1.0)
         self.boto_config = {**default_config, **self.boto_config}
-        
+
         # Create boto3 clients with shared session and config
         boto_config_obj = botocore.config.Config(**self.boto_config)
         self.bedrock_runtime = self.session.client('bedrock-runtime', config=boto_config_obj)
         self.bedrock = self.session.client('bedrock', config=boto_config_obj)
-        
+
         # Initialize async clients
         self.async_session = None
         self.async_bedrock_runtime = None
-        
+
         # Store model ID and determine provider
         self.model_id = config.model
         self.use_inference_profile = use_inference_profile
@@ -165,7 +172,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
         # Provider-specific settings
         self.max_image_size_mb = self._get_max_image_size()
-        
+
         # Metrics configuration
         self.enable_metrics = enable_metrics and HAS_CLOUDWATCH
         self.metrics_namespace = "BespokeLabs/Curator/Bedrock"
@@ -177,10 +184,10 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             except (ClientError, NoCredentialsError) as e:
                 logger.warning(f"Failed to initialize CloudWatch client: {str(e)}")
                 self.enable_metrics = False
-        
+
         # Request tracking for metrics
         self.request_start_times = {}
-        
+
         # Initialize token count tracking for better estimation
         self.token_count_history = []
         self.max_token_history = 100
@@ -320,21 +327,21 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
     async def initialize_async_clients(self):
         """Initialize async boto3 clients for better performance.
-        
+
         This method creates async clients that can be used for concurrent API calls.
         """
         if self.async_session is None:
             self.async_session = aioboto3.Session(region_name=self.region_name)
-            
+
         # Create async bedrock runtime client if not already initialized
         if self.async_bedrock_runtime is None:
             self.async_bedrock_runtime = await self.async_session.client(
                 'bedrock-runtime',
                 config=botocore.config.Config(**self.boto_config)
             ).__aenter__()
-            
+
             logger.info(f"Initialized async boto3 clients for region {self.region_name}")
-    
+
     def estimate_total_tokens(self, messages: list) -> _TokenUsage:
         """Estimate token usage for the given messages.
 
@@ -346,12 +353,12 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         """
         # Improved token estimation with model-specific adjustments
         total_text = ""
-        
+
         # Count role overhead tokens based on model provider
         role_overhead = 0
         message_count = 0
         has_system_message = False
-        
+
         if isinstance(messages, list):
             message_count = len(messages)
             for message in messages:
@@ -365,7 +372,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                         role_overhead += 4  # Approximate overhead for user message
                     elif role == "assistant":
                         role_overhead += 6  # Approximate overhead for assistant message
-                    
+
                     # Process content
                     content = message.get("content", "")
                     if isinstance(content, list):
@@ -386,7 +393,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                     total_text += message
         elif isinstance(messages, str):
             total_text = messages
-        
+
         # Model-specific token ratio adjustments
         chars_per_token = 4.0  # Default for English text
         if self.model_provider == "anthropic":
@@ -395,18 +402,18 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             chars_per_token = 3.7  # Llama models tokenization
         elif self.model_provider == "mistral":
             chars_per_token = 3.6  # Mistral models tokenization
-            
+
         # Calculate input tokens with formatting overhead
         format_overhead = 10  # Base overhead for request formatting
         if has_system_message:
             format_overhead += 5  # Additional overhead for system message
-            
+
         # Calculate tokens from text length
         text_tokens = int(len(total_text) / chars_per_token)
-        
+
         # Total input tokens with all overhead
         input_tokens = text_tokens + role_overhead + format_overhead
-        
+
         # Estimate output tokens based on historical data if available
         if self.token_count_history:
             # Use moving average of past responses
@@ -419,7 +426,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             else:
                 # Other models tend to be more concise
                 output_tokens = max(50, int(input_tokens * 0.8))
-        
+
         return _TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
 
     def estimate_output_tokens(self) -> int:
@@ -749,17 +756,17 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
     def _select_optimal_api(self, generic_request: GenericRequest) -> str:
         """Select the optimal API based on request characteristics.
-        
+
         Args:
             generic_request: The generic request to analyze
-            
+
         Returns:
             String indicating which API to use: 'converse' or 'invoke_model'
         """
         # Check if model supports Converse API
         if not self._supports_converse_api():
             return 'invoke_model'
-            
+
         # Check for multimodal content which is better handled by Converse API
         has_multimodal = False
         if isinstance(generic_request.messages, list):
@@ -769,14 +776,14 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                         if isinstance(content_item, dict) and "image" in content_item:
                             has_multimodal = True
                             break
-        
+
         if has_multimodal:
             return 'converse'
-            
+
         # Check for multi-turn conversation which is better with Converse API
         if isinstance(generic_request.messages, list) and len(generic_request.messages) > 1:
             return 'converse'
-            
+
         # Check for system message which is better handled by Converse API
         has_system = False
         if isinstance(generic_request.messages, list):
@@ -784,17 +791,17 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                 if isinstance(message, dict) and message.get("role") == "system":
                     has_system = True
                     break
-        
+
         if has_system:
             return 'converse'
-            
+
         # For simple text completion with no special requirements, invoke_model can be more efficient
         if len(generic_request.messages) == 1 and self.model_provider not in ["anthropic", "meta", "mistral"]:
             return 'invoke_model'
-            
+
         # Default to Converse API for better compatibility
         return 'converse'
-    
+
     def create_api_specific_request_online(self, generic_request: GenericRequest) -> dict:
         """Create a model-specific request from a generic request for online inference.
 
@@ -809,11 +816,11 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
         # Select optimal API based on request characteristics
         api_type = self._select_optimal_api(generic_request)
-        
+
         # Log request details with structured logging
         request_id = f"req_{int(time.time() * 1000)}"
         self.request_start_times[request_id] = time.time()
-        
+
         logger.info(
             f"Processing request {request_id}",
             extra={
@@ -825,7 +832,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                 "region": self.region_name
             }
         )
-        
+
         # Format request based on selected API
         try:
             if api_type == 'converse':
@@ -965,7 +972,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         session: aiohttp.ClientSession,
         status_tracker: OnlineStatusTracker,
     ) -> GenericResponse:
-        """Make a single API request to AWS Bedrock.
+        """Make a single API request to AWS Bedrock with exponential backoff retry.
 
         Args:
             request: The API request to make
@@ -976,146 +983,183 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             GenericResponse containing the model's response
 
         Raises:
-            Exception: If the API call fails
+            Exception: If the API call fails after all retries
         """
         # Generate a unique request ID for tracking
         request_id = f"req_{int(time.time() * 1000)}"
         start_time = time.time()
         self.request_start_times[request_id] = start_time
-        
-        try:
-            # Initialize async clients if needed
-            if self.async_bedrock_runtime is None:
-                await self.initialize_async_clients()
-                
-            # Get the request body
-            request_body = request.api_specific_request
-            
-            # Determine which API to use based on request format
-            use_converse_api = "messages" in request_body and (
-                "system" in request_body or
-                any(isinstance(msg.get("content"), list) for msg in request_body["messages"]
-                    if isinstance(msg, dict))
-            )
-            
-            if use_converse_api:
-                # Prepare parameters for converse API
-                params = {
-                    "modelId": self.model_id,
-                    "messages": request_body["messages"]
-                }
 
-                # Add system message if present
-                if request_body.get("system"):
-                    if isinstance(request_body["system"], str):
-                        params["system"] = [{"text": request_body["system"]}]
-                    else:
-                        params["system"] = request_body["system"]
+        # Initialize retry counter
+        retries = 0
+        max_retries = self.config.max_retries
 
-                # Add inference config if present
-                if request_body.get("inferenceConfig"):
-                    params["inferenceConfig"] = {
-                        "temperature": request_body["inferenceConfig"].get("temperature"),
-                        "topP": request_body["inferenceConfig"].get("topP"),
-                        "maxTokens": request_body["inferenceConfig"].get("maxTokens"),
-                        "stopSequences": request_body["inferenceConfig"].get("stopSequences")
+        # Implement exponential backoff retry loop
+        while retries <= max_retries:
+            try:
+                # Initialize async clients if needed
+                if self.async_bedrock_runtime is None:
+                    await self.initialize_async_clients()
+
+                # Get the request body
+                request_body = request.api_specific_request
+
+                # Determine which API to use based on request format
+                use_converse_api = "messages" in request_body and (
+                    "system" in request_body or
+                    any(isinstance(msg.get("content"), list) for msg in request_body["messages"]
+                        if isinstance(msg, dict))
+                )
+
+                if use_converse_api:
+                    # Prepare parameters for converse API
+                    params = {
+                        "modelId": self.model_id,
+                        "messages": request_body["messages"]
                     }
 
-                logger.debug(f"Making Converse API request for {request_id}")
-                response = await self.async_bedrock_runtime.converse(**params)
-                response_body = response
-                text_response, token_usage = self._extract_converse_response(response_body)
-            else:
-                # Use invoke_model API for non-chat requests
-                logger.debug(f"Making invoke_model API request for {request_id}")
-                response = await self.async_bedrock_runtime.invoke_model(
-                    modelId=self.model_id,
-                    body=json.dumps(request_body)
-                )
-                
-                # Parse response based on model provider
-                response_body = json.loads(await response["body"].read())
-                
-                # Extract text and token usage based on provider
-                if self.model_provider == "anthropic":
-                    text_response = response_body.get("completion", "")
-                    token_usage = _TokenUsage(
-                        input_tokens=response_body.get("usage", {}).get("input_tokens", 0),
-                        output_tokens=response_body.get("usage", {}).get("output_tokens", 0)
+                    # Add system message if present
+                    if request_body.get("system"):
+                        if isinstance(request_body["system"], str):
+                            params["system"] = [{"text": request_body["system"]}]
+                        else:
+                            params["system"] = request_body["system"]
+
+                    # Add inference config if present
+                    if request_body.get("inferenceConfig"):
+                        params["inferenceConfig"] = {
+                            "temperature": request_body["inferenceConfig"].get("temperature"),
+                            "topP": request_body["inferenceConfig"].get("topP"),
+                            "maxTokens": request_body["inferenceConfig"].get("maxTokens"),
+                            "stopSequences": request_body["inferenceConfig"].get("stopSequences")
+                        }
+
+                    logger.debug(f"Making Converse API request for {request_id}")
+                    response = await self.async_bedrock_runtime.converse(**params)
+                    response_body = response
+                    text_response, token_usage = self._extract_converse_response(response_body)
+                else:
+                    # Use invoke_model API for non-chat requests
+                    logger.debug(f"Making invoke_model API request for {request_id}")
+                    response = await self.async_bedrock_runtime.invoke_model(
+                        modelId=self.model_id,
+                        body=json.dumps(request_body)
                     )
-                elif self.model_provider == "amazon":
-                    text_response = response_body.get("results", [{}])[0].get("outputText", "")
-                    # Amazon doesn't provide token counts, estimate based on text length
-                    token_usage = _TokenUsage(
-                        input_tokens=len(request_body.get("inputText", "")) // 4,
-                        output_tokens=len(text_response) // 4
+
+                    # Parse response based on model provider
+                    response_body = json.loads(await response["body"].read())
+
+                    # Extract text and token usage based on provider
+                    if self.model_provider == "anthropic":
+                        text_response = response_body.get("completion", "")
+                        token_usage = _TokenUsage(
+                            input=response_body.get("usage", {}).get("input_tokens", 0),
+                            output=response_body.get("usage", {}).get("output_tokens", 0)
+                        )
+                    elif self.model_provider == "amazon":
+                        text_response = response_body.get("results", [{}])[0].get("outputText", "")
+                        # Amazon doesn't provide token counts, estimate based on text length
+                        token_usage = _TokenUsage(
+                            input=len(request_body.get("inputText", "")) // 4,
+                            output=len(text_response) // 4
+                        )
+                    else:
+                        # Generic fallback for other providers
+                        text_response = str(response_body)
+                        token_usage = _TokenUsage(input=0, output=0)
+
+                # Record token usage for future estimation
+                if token_usage and token_usage.output is not None and token_usage.output > 0:
+                    self.token_count_history.append((time.time(), token_usage.output))
+                    # Keep history to a reasonable size
+                    if len(self.token_count_history) > self.max_token_history:
+                        self.token_count_history.pop(0)
+
+                # Get current time for timestamps
+                current_time = datetime.datetime.now(datetime.UTC)
+
+                # Calculate latency
+                latency = time.time() - start_time
+
+                # Log response details with structured logging
+                logger.info(
+                    f"Request {request_id} completed in {latency:.2f}s",
+                    extra={
+                        "request_id": request_id,
+                        "latency": latency,
+                        "input_tokens": token_usage.input if token_usage else 0,
+                        "output_tokens": token_usage.output if token_usage else 0,
+                        "model_id": self.model_id
+                    }
+                )
+
+                # Publish metrics if enabled
+                if self.enable_metrics:
+                    self._publish_request_metrics(request_id, token_usage, latency)
+
+                # Create and return the response
+                return GenericResponse(
+                    response_message=text_response,
+                    token_usage=token_usage,
+                    raw_response=response_body,
+                    generic_request=request.generic_request,
+                    created_at=current_time,
+                    finished_at=current_time
+                )
+
+            except Exception as e:
+                is_throttling = "ThrottlingException" in str(e) or "Too many requests" in str(e)
+
+                # Increment retry counter
+                retries += 1
+
+                # If we've exhausted all retries, log and raise the error
+                if retries > max_retries:
+                    # Log error with structured logging
+                    latency = time.time() - start_time
+                    logger.error(
+                        f"Error making API request after {max_retries} retries: {str(e)}",
+                        extra={
+                            "request_id": request_id,
+                            "error": str(e),
+                            "latency": latency,
+                            "model_id": self.model_id,
+                            "retries": retries - 1
+                        }
+                    )
+
+                    # Publish error metrics if enabled
+                    if self.enable_metrics:
+                        self._publish_error_metrics(request_id, str(e), latency)
+
+                    raise
+
+                # Calculate delay with exponential backoff and jitter
+                delay = min(self.max_delay, self.base_delay * (2 ** (retries - 1)))
+                jitter = delay * self.jitter_factor * (2 * random.random() - 1)  # Random jitter between -jitter_factor and +jitter_factor
+                delay = max(0, delay + jitter)
+
+                # For throttling errors, use a longer delay
+                if is_throttling:
+                    delay = delay * 2
+                    status_tracker.time_of_last_rate_limit_error = time.time()
+                    status_tracker.num_rate_limit_errors += 1
+                    logger.warning(
+                        f"Throttling exception encountered for request {request_id}. "
+                        f"Retry {retries}/{max_retries} in {delay:.2f}s"
                     )
                 else:
-                    # Generic fallback for other providers
-                    text_response = str(response_body)
-                    token_usage = _TokenUsage(input_tokens=0, output_tokens=0)
+                    logger.warning(
+                        f"Error in request {request_id}: {str(e)}. "
+                        f"Retry {retries}/{max_retries} in {delay:.2f}s"
+                    )
 
-            # Record token usage for future estimation
-            if token_usage and token_usage.output_tokens > 0:
-                self.token_count_history.append((time.time(), token_usage.output_tokens))
-                # Keep history to a reasonable size
-                if len(self.token_count_history) > self.max_token_history:
-                    self.token_count_history.pop(0)
+                # Wait before retrying
+                await asyncio.sleep(delay)
 
-            # Get current time for timestamps
-            current_time = datetime.datetime.now(datetime.UTC)
-            
-            # Calculate latency
-            latency = time.time() - start_time
-            
-            # Log response details with structured logging
-            logger.info(
-                f"Request {request_id} completed in {latency:.2f}s",
-                extra={
-                    "request_id": request_id,
-                    "latency": latency,
-                    "input_tokens": token_usage.input_tokens if token_usage else 0,
-                    "output_tokens": token_usage.output_tokens if token_usage else 0,
-                    "model_id": self.model_id
-                }
-            )
-            
-            # Publish metrics if enabled
-            if self.enable_metrics:
-                self._publish_request_metrics(request_id, token_usage, latency)
-
-            # Create and return the response
-            return GenericResponse(
-                response_message=text_response,
-                token_usage=token_usage,
-                raw_response=response_body,
-                generic_request=request.generic_request,
-                created_at=current_time,
-                finished_at=current_time
-            )
-
-        except Exception as e:
-            # Log error with structured logging
-            latency = time.time() - start_time
-            logger.error(
-                f"Error making API request: {str(e)}",
-                extra={
-                    "request_id": request_id,
-                    "error": str(e),
-                    "latency": latency,
-                    "model_id": self.model_id
-                }
-            )
-            
-            # Publish error metrics if enabled
-            if self.enable_metrics:
-                self._publish_error_metrics(request_id, str(e), latency)
-                
-            raise
-            
     def _publish_request_metrics(self, request_id: str, token_usage: _TokenUsage, latency: float):
         """Publish request metrics to CloudWatch.
-        
+
         Args:
             request_id: Unique identifier for the request
             token_usage: Token usage information
@@ -1123,7 +1167,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         """
         if not self.enable_metrics or not self.cloudwatch_client:
             return
-            
+
         try:
             metrics = [
                 {
@@ -1142,7 +1186,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                         {'Name': 'Provider', 'Value': self.model_provider}
                     ],
                     'Unit': 'Count',
-                    'Value': token_usage.input_tokens if token_usage else 0
+                    'Value': token_usage.input if token_usage else 0
                 },
                 {
                     'MetricName': 'OutputTokens',
@@ -1151,7 +1195,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                         {'Name': 'Provider', 'Value': self.model_provider}
                     ],
                     'Unit': 'Count',
-                    'Value': token_usage.output_tokens if token_usage else 0
+                    'Value': token_usage.output if token_usage else 0
                 },
                 {
                     'MetricName': 'RequestCount',
@@ -1163,19 +1207,19 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                     'Value': 1.0
                 }
             ]
-            
+
             self.cloudwatch_client.put_metric_data(
                 Namespace=self.metrics_namespace,
                 MetricData=metrics
             )
-            
+
             logger.debug(f"Published metrics for request {request_id}")
         except Exception as e:
             logger.warning(f"Failed to publish metrics: {str(e)}")
-            
+
     def _publish_error_metrics(self, request_id: str, error_message: str, latency: float):
         """Publish error metrics to CloudWatch.
-        
+
         Args:
             request_id: Unique identifier for the request
             error_message: Error message
@@ -1183,7 +1227,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         """
         if not self.enable_metrics or not self.cloudwatch_client:
             return
-            
+
         try:
             # Extract error type from error message
             error_type = "Unknown"
@@ -1195,7 +1239,7 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                 error_type = "NotFound"
             elif "permission" in error_message.lower():
                 error_type = "Permission"
-            
+
             metrics = [
                 {
                     'MetricName': 'ErrorCount',
@@ -1217,12 +1261,12 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
                     'Value': latency
                 }
             ]
-            
+
             self.cloudwatch_client.put_metric_data(
                 Namespace=self.metrics_namespace,
                 MetricData=metrics
             )
-            
+
             logger.debug(f"Published error metrics for request {request_id}")
         except Exception as e:
             logger.warning(f"Failed to publish error metrics: {str(e)}")
