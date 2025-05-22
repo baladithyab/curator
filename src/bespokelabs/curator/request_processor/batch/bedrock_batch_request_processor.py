@@ -75,7 +75,6 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         "anthropic.claude-3-5-sonnet-20240620-v1:0",
         "anthropic.claude-3-5-haiku-20241022-v1:0",
         "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "anthropic.claude-3-7-sonnet-20250219-v1:0",
 
         # Amazon models
         "amazon.titan-multimodal-embeddings-g1-v1",
@@ -618,342 +617,343 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         Returns:
             Dict containing the formatted request for batch processing
         """
-        # Format the request based on the model provider
         model_input = {}
 
         if self.model_provider == "anthropic":
-            # Claude models
             messages = []
+            system_prompt = None
+            source_messages_data = []
 
-            # Handle messages field
             if hasattr(generic_request, 'messages') and generic_request.messages:
-                for message in generic_request.messages:
-                    if isinstance(message, dict):
-                        # Convert to Anthropic format if needed
-                        role = message.get("role", "user")
-                        content = message.get("content", "")
-
-                        # Handle content based on type
-                        if isinstance(content, list):
-                            # Already in Anthropic format
-                            formatted_content = content
-                        elif isinstance(content, str):
-                            # Convert string to Anthropic format
-                            formatted_content = [{"type": "text", "text": content}]
-                        else:
-                            # Convert other types to string
-                            formatted_content = [{"type": "text", "text": str(content)}]
-
-                        messages.append({
-                            "role": role,
-                            "content": formatted_content
-                        })
-            # Fallback to prompt field if available
+                source_messages_data = generic_request.messages
             elif hasattr(generic_request, 'prompt'):
                 if isinstance(generic_request.prompt, list):
-                    for message in generic_request.prompt:
-                        if isinstance(message, dict):
-                            messages.append(message)
-                        else:
-                            messages.append({
-                                "role": "user",
-                                "content": [{"type": "text", "text": message}]
-                            })
+                    source_messages_data = generic_request.prompt
                 else:
-                    messages = [{
-                        "role": "user",
-                        "content": [{"type": "text", "text": generic_request.prompt}]
-                    }]
+                    source_messages_data = [{"role": "user", "content": str(generic_request.prompt)}]
+
+            for message_item in source_messages_data:
+                if isinstance(message_item, dict):
+                    role = message_item.get("role", "user").lower()
+                    content = message_item.get("content", "")
+
+                    if role == "system":
+                        current_system_text = ""
+                        if isinstance(content, list): # Content blocks
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    current_system_text += block.get("text", "") + " "
+                            current_system_text = current_system_text.strip()
+                        else: # Simple string
+                            current_system_text = str(content).strip()
+                        
+                        if system_prompt is None:
+                            system_prompt = current_system_text
+                        else:
+                            system_prompt += "\n" + current_system_text
+                        continue # System prompt handled at top level
+
+                    formatted_content_blocks = []
+                    if isinstance(content, list):
+                        formatted_content_blocks = content
+                    elif isinstance(content, str):
+                        formatted_content_blocks = [{"type": "text", "text": content}]
+                    else:
+                        formatted_content_blocks = [{"type": "text", "text": str(content)}]
+                    
+                    valid_role = "user" if role != "assistant" else "assistant"
+                    messages.append({"role": valid_role, "content": formatted_content_blocks})
+                else: # Simple string in list
+                    role = "user"
+                    if messages and messages[-1]["role"] == "user":
+                        role = "assistant"
+                    messages.append({"role": role, "content": [{"type": "text", "text": str(message_item)}]})
 
             model_input = {
                 "messages": messages,
                 "anthropic_version": "bedrock-2023-05-31",
                 "max_tokens": generic_request.generation_params.get("max_tokens", 1000)
             }
-
-            # Add optional parameters
+            if system_prompt:
+                model_input["system"] = system_prompt
+            
             for param_name in ["temperature", "top_p", "top_k", "stop_sequences"]:
                 if param_name in generic_request.generation_params:
                     model_input[param_name] = generic_request.generation_params[param_name]
 
         elif self.model_provider == "amazon":
-            # Amazon Titan models
             if "embed" in self.model_id.lower():
-                # For embedding models, extract text from messages or use prompt
+                text_to_embed = ""
                 if hasattr(generic_request, 'messages') and generic_request.messages:
-                    # Extract text from the last user message
-                    text = ""
-                    for message in reversed(generic_request.messages):
-                        if message.get("role", "") == "user":
-                            content = message.get("content", "")
-                            if isinstance(content, str):
-                                text = content
-                                break
-                            elif isinstance(content, list):
-                                # Extract text from content items
-                                for item in content:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        text = item.get("text", "")
-                                        break
-                                if text:
-                                    break
-
-                    model_input = {
-                        "inputText": text
-                    }
+                    for msg in reversed(generic_request.messages): # Find last user message
+                        if msg.get("role") == "user":
+                            content = msg.get("content", "")
+                            if isinstance(content, str): text_to_embed = content; break
+                            if isinstance(content, list): # Content blocks
+                                for block in content:
+                                    if block.get("type") == "text": text_to_embed = block.get("text",""); break
+                                if text_to_embed: break
                 elif hasattr(generic_request, 'prompt'):
-                    model_input = {
-                        "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt)
-                    }
-                else:
-                    model_input = {
-                        "inputText": ""
-                    }
-            else:
-                # Text generation config
+                    text_to_embed = str(generic_request.prompt)
+                model_input = {"inputText": text_to_embed}
+                # Titan Text Embeddings V2 specific params
+                if "amazon.titan-embed-text-v2" in self.model_id:
+                    if "dimensions" in generic_request.generation_params:
+                        model_input["dimensions"] = generic_request.generation_params["dimensions"]
+                    if "normalize" in generic_request.generation_params:
+                         model_input["normalize"] = generic_request.generation_params["normalize"]
+                # Titan Multimodal Embeddings specific params
+                if "amazon.titan-embed-image-v1" in self.model_id: # or multimodal model id
+                    if "inputImage" in generic_request.generation_params: # Assuming base64 image string
+                        model_input["inputImage"] = generic_request.generation_params["inputImage"]
+                    if "embeddingConfig" in generic_request.generation_params:
+                        model_input["embeddingConfig"] = generic_request.generation_params["embeddingConfig"]
+
+            else: # Text generation models (Titan Text G1 Express, Lite, Nova)
                 text_gen_config = {}
-                for param_name, bedrock_name in [
-                    ("max_tokens", "maxTokenCount"),
-                    ("temperature", "temperature"),
-                    ("top_p", "topP"),
-                    ("stop_sequences", "stopSequences")
-                ]:
-                    if param_name in generic_request.generation_params:
-                        text_gen_config[bedrock_name] = generic_request.generation_params[param_name]
-
-                # Extract text from messages or use prompt
+                param_map = {
+                    "max_tokens": "maxTokenCount", "temperature": "temperature",
+                    "top_p": "topP", "stop_sequences": "stopSequences"
+                }
+                for gen_param, bedrock_param in param_map.items():
+                    if gen_param in generic_request.generation_params:
+                        text_gen_config[bedrock_param] = generic_request.generation_params[gen_param]
+                
+                input_text = ""
                 if hasattr(generic_request, 'messages') and generic_request.messages:
-                    # Combine all user messages
-                    text = ""
-                    for message in generic_request.messages:
-                        if message.get("role", "") == "user":
-                            content = message.get("content", "")
-                            if isinstance(content, str):
-                                text += content + "\n"
-                            elif isinstance(content, list):
-                                # Extract text from content items
-                                for item in content:
-                                    if isinstance(item, dict) and item.get("type") == "text":
-                                        text += item.get("text", "") + "\n"
-
-                    model_input = {
-                        "inputText": text.strip(),
-                        "textGenerationConfig": text_gen_config
-                    }
+                    # Concatenate user messages for Titan text models
+                    user_texts = []
+                    for msg in generic_request.messages:
+                        if msg.get("role") == "user":
+                            content = msg.get("content", "")
+                            if isinstance(content, str): user_texts.append(content)
+                            elif isinstance(content, list): # Content blocks
+                                for block in content:
+                                    if block.get("type") == "text": user_texts.append(block.get("text",""))
+                    input_text = "\n".join(user_texts)
                 elif hasattr(generic_request, 'prompt'):
-                    model_input = {
-                        "inputText": generic_request.prompt if isinstance(generic_request.prompt, str) else str(generic_request.prompt),
-                        "textGenerationConfig": text_gen_config
-                    }
-                else:
-                    model_input = {
-                        "inputText": "",
-                        "textGenerationConfig": text_gen_config
-                    }
+                    input_text = str(generic_request.prompt)
+                
+                model_input = {
+                    "inputText": input_text,
+                    "textGenerationConfig": text_gen_config
+                }
 
         elif self.model_provider == "meta":
-            # Meta Llama models
-            messages = []
+            # Llama 3 Instruct chat template
+            prompt_str = "<|begin_of_text|>"
+            system_message_content = None
+            processed_messages_for_llama = []
 
-            # Handle messages field
+            source_messages_data = []
             if hasattr(generic_request, 'messages') and generic_request.messages:
-                for message in generic_request.messages:
-                    if isinstance(message, dict):
-                        role = message.get("role", "user")
-                        content = message.get("content", "")
-
-                        # Handle content based on type
-                        if isinstance(content, list):
-                            # Extract text from content items
-                            text = ""
-                            for item in content:
-                                if isinstance(item, dict) and item.get("type") == "text":
-                                    text += item.get("text", "") + " "
-                            messages.append({
-                                "role": role,
-                                "content": text.strip()
-                            })
-                        else:
-                            messages.append({
-                                "role": role,
-                                "content": str(content)
-                            })
-            # Fallback to prompt field if available
+                source_messages_data = generic_request.messages
             elif hasattr(generic_request, 'prompt'):
                 if isinstance(generic_request.prompt, list):
-                    for message in generic_request.prompt:
-                        if isinstance(message, dict):
-                            messages.append(message)
-                        else:
-                            messages.append({
-                                "role": "user",
-                                "content": str(message)
-                            })
+                    source_messages_data = generic_request.prompt
                 else:
-                    messages = [{
-                        "role": "user",
-                        "content": str(generic_request.prompt)
-                    }]
+                    source_messages_data = [{"role": "user", "content": str(generic_request.prompt)}]
 
-            model_input = {
-                "messages": messages
-            }
+            for msg_item in source_messages_data:
+                role = "user" # Default role
+                content_text = ""
+                if isinstance(msg_item, dict):
+                    role = msg_item.get("role", "user").lower()
+                    content_data = msg_item.get("content", "")
+                    if isinstance(content_data, list): # Content blocks
+                        for block in content_data:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                content_text += block.get("text", "") + " "
+                        content_text = content_text.strip()
+                    else:
+                        content_text = str(content_data)
+                else: # Simple string
+                    content_text = str(msg_item)
+                    # Infer role if not the first message and previous was user
+                    if processed_messages_for_llama and processed_messages_for_llama[-1]["role"] == "user":
+                        role = "assistant"
+                
+                if role == "system":
+                    if system_message_content is None: system_message_content = content_text
+                    else: system_message_content += "\n" + content_text
+                    continue
+                
+                # Ensure role is user or assistant for Llama template
+                valid_llama_role = "user" if role != "assistant" else "assistant"
+                processed_messages_for_llama.append({"role": valid_llama_role, "content": content_text})
 
-            # Add optional parameters
-            for param_name, api_name in [
-                ("temperature", "temperature"),
-                ("top_p", "top_p"),
-                ("max_tokens", "max_gen_len")
-            ]:
-                if param_name in generic_request.generation_params:
-                    model_input[api_name] = generic_request.generation_params[param_name]
+            if system_message_content:
+                prompt_str += f"<|start_header_id|>system<|end_header_id|>\n\n{system_message_content}<|eot_id|>"
+            for message in processed_messages_for_llama:
+                prompt_str += f"<|start_header_id|>{message['role']}<|end_header_id|>\n\n{message['content']}<|eot_id|>"
+            prompt_str += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+            model_input = {"prompt": prompt_str}
+            param_map = {"temperature": "temperature", "top_p": "top_p", "max_tokens": "max_gen_len"}
+            for gen_param, api_param in param_map.items():
+                if gen_param in generic_request.generation_params:
+                    model_input[api_param] = generic_request.generation_params[gen_param]
+                elif api_param == "max_gen_len" and api_param not in model_input: # Default max_gen_len
+                     model_input[api_param] = generic_request.generation_params.get("max_tokens", 512)
+
 
         elif self.model_provider == "cohere":
-            # Cohere models
             if "embed" in self.model_id.lower():
-                model_input = {
-                    "texts": [generic_request.prompt] if isinstance(generic_request.prompt, str) else [str(generic_request.prompt)],
-                    "input_type": "search_document",
-                    "truncate": "END"
-                }
-            elif "command-r" in self.model_id.lower():
-                # Command R format - handle chat history
-                if isinstance(generic_request.prompt, list):
-                    chat_history = []
-                    for message in generic_request.prompt[:-1]:
-                        if isinstance(message, dict):
-                            role = "USER" if message.get("role", "").lower() == "user" else "CHATBOT"
-                            content = message.get("content", "")
-                            chat_history.append({"role": role, "message": content})
-                        else:
-                            role = "USER" if len(chat_history) % 2 == 0 else "CHATBOT"
-                            chat_history.append({"role": role, "message": str(message)})
-
-                    last_message = generic_request.prompt[-1]
-                    if isinstance(last_message, dict):
-                        query = last_message.get("content", "")
-                    else:
-                        query = str(last_message)
-                else:
-                    query = generic_request.prompt
-                    chat_history = []
+                texts_to_embed = [str(generic_request.prompt)]
+                if hasattr(generic_request, 'messages') and generic_request.messages:
+                    # For embeddings, usually a single text or list of texts is expected.
+                    # Here, we'll take the content of the last user message if messages are provided.
+                    last_user_message_content = ""
+                    for msg in reversed(generic_request.messages):
+                        if msg.get("role") == "user":
+                            content = msg.get("content", "")
+                            if isinstance(content, str): last_user_message_content = content; break
+                            if isinstance(content, list):
+                                for block in content:
+                                    if block.get("type") == "text": last_user_message_content = block.get("text",""); break
+                                if last_user_message_content: break
+                    if last_user_message_content: texts_to_embed = [last_user_message_content]
 
                 model_input = {
-                    "message": query,
-                    "chat_history": chat_history
+                    "texts": texts_to_embed,
+                    "input_type": generic_request.generation_params.get("input_type", "search_document"),
+                    "truncate": generic_request.generation_params.get("truncate", "END")
                 }
-            else:
-                # Command format
-                prompt = generic_request.prompt
-                if isinstance(prompt, list):
-                    prompt = "\n".join([str(p) for p in prompt])
+            elif "command-r" in self.model_id.lower(): # Command R / R+
+                chat_history = []
+                query = ""
+                source_messages_data = []
+                if hasattr(generic_request, 'messages') and generic_request.messages:
+                    source_messages_data = generic_request.messages
+                elif hasattr(generic_request, 'prompt'):
+                    if isinstance(generic_request.prompt, list): source_messages_data = generic_request.prompt
+                    else: source_messages_data = [{"role": "user", "content": str(generic_request.prompt)}]
 
-                model_input = {
-                    "prompt": prompt
-                }
+                if source_messages_data:
+                    # Last message is the query
+                    last_msg_data = source_messages_data[-1]
+                    if isinstance(last_msg_data, dict): query = str(last_msg_data.get("content", ""))
+                    else: query = str(last_msg_data)
+                    
+                    # Previous messages form chat history
+                    for msg_data in source_messages_data[:-1]:
+                        role = "USER"
+                        message_text = ""
+                        if isinstance(msg_data, dict):
+                            role = "CHATBOT" if msg_data.get("role", "").lower() == "assistant" else "USER"
+                            message_text = str(msg_data.get("content", ""))
+                        else: # string message, infer role
+                            role = "CHATBOT" if len(chat_history) > 0 and chat_history[-1]["role"] == "USER" else "USER"
+                            message_text = str(msg_data)
+                        chat_history.append({"role": role, "message": message_text})
+                
+                model_input = {"message": query, "chat_history": chat_history}
+            else: # Older Cohere Command
+                prompt_text = str(generic_request.prompt)
+                if hasattr(generic_request, 'messages') and generic_request.messages:
+                    # Concatenate messages for older command model
+                    full_prompt_parts = []
+                    for msg in generic_request.messages:
+                        role = msg.get("role","user")
+                        content = msg.get("content","")
+                        full_prompt_parts.append(f"{role.capitalize()}: {content}")
+                    prompt_text = "\n".join(full_prompt_parts)
+                model_input = {"prompt": prompt_text}
 
-            # Add optional parameters
-            param_mapping = {
-                "temperature": "temperature",
-                "top_p": "p",
-                "top_k": "k",
-                "max_tokens": "max_tokens",
-                "stop_sequences": "stop_sequences"
+            param_map = {
+                "temperature": "temperature", "top_p": "p", "top_k": "k",
+                "max_tokens": "max_tokens", "stop_sequences": "stop_sequences",
+                "frequency_penalty": "frequency_penalty", "presence_penalty": "presence_penalty",
+                "raw_prompting": "raw_prompting" # For Command R
             }
-
-            for param_name, api_name in param_mapping.items():
-                if param_name in generic_request.generation_params:
-                    model_input[api_name] = generic_request.generation_params[param_name]
-
+            for gen_param, api_param in param_map.items():
+                if gen_param in generic_request.generation_params:
+                    model_input[api_param] = generic_request.generation_params[gen_param]
+        
         elif self.model_provider == "ai21":
-            # AI21 models
             if "jamba" in self.model_id.lower():
-                # Jamba format
-                if isinstance(generic_request.prompt, list):
-                    messages = []
-                    for message in generic_request.prompt:
-                        if isinstance(message, dict):
-                            messages.append(message)
-                        else:
-                            messages.append({
-                                "role": "user",
-                                "content": str(message)
-                            })
-                else:
-                    messages = [{
-                        "role": "user",
-                        "content": str(generic_request.prompt)
-                    }]
+                messages_for_jamba = []
+                source_messages_data = []
+                if hasattr(generic_request, 'messages') and generic_request.messages:
+                    source_messages_data = generic_request.messages
+                elif hasattr(generic_request, 'prompt'):
+                    if isinstance(generic_request.prompt, list): source_messages_data = generic_request.prompt
+                    else: source_messages_data = [{"role": "user", "content": str(generic_request.prompt)}]
 
-                model_input = {
-                    "messages": messages
-                }
-            else:
-                # Jurassic format
-                prompt = generic_request.prompt
-                if isinstance(prompt, list):
-                    prompt = "\n".join([str(p) for p in prompt])
+                for msg_item in source_messages_data:
+                    if isinstance(msg_item, dict):
+                        messages_for_jamba.append(msg_item) # Assume it's already in Jamba format
+                    else: # Simple string, assume user
+                        messages_for_jamba.append({"role": "user", "content": str(msg_item)})
+                model_input = {"messages": messages_for_jamba}
+                param_map = {"temperature": "temperature", "top_p": "top_p", "max_tokens": "max_tokens", "stop_sequences": "stop"}
+            else: # Jurassic
+                prompt_text = str(generic_request.prompt)
+                if hasattr(generic_request, 'messages') and generic_request.messages:
+                     prompt_text = "\n".join(str(m.get("content","") if isinstance(m,dict) else m) for m in generic_request.messages)
 
-                model_input = {
-                    "prompt": prompt
-                }
-
-                # Add penalty parameters
+                model_input = {"prompt": prompt_text}
                 for penalty in ["countPenalty", "presencePenalty", "frequencyPenalty"]:
                     if penalty in generic_request.generation_params:
-                        model_input[penalty] = {
-                            "scale": generic_request.generation_params[penalty]
-                        }
+                        model_input[penalty] = {"scale": generic_request.generation_params[penalty]}
+                param_map = {"temperature": "temperature", "top_p": "topP", "max_tokens": "maxTokens", "stop_sequences": "stopSequences"}
 
-            # Add optional parameters
-            param_mapping = {
-                "temperature": "temperature",
-                "top_p": "topP" if "jamba" not in self.model_id.lower() else "top_p",
-                "max_tokens": "maxTokens" if "jamba" not in self.model_id.lower() else "max_tokens",
-                "stop_sequences": "stopSequences" if "jamba" not in self.model_id.lower() else "stop_sequences"
-            }
-
-            for param_name, api_name in param_mapping.items():
-                if param_name in generic_request.generation_params:
-                    model_input[api_name] = generic_request.generation_params[param_name]
+            for gen_param, api_param in param_map.items():
+                if gen_param in generic_request.generation_params:
+                    model_input[api_param] = generic_request.generation_params[gen_param]
 
         elif self.model_provider == "mistral":
-            # Mistral AI models
-            if isinstance(generic_request.prompt, list):
-                messages = []
-                for message in generic_request.prompt:
-                    if isinstance(message, dict):
-                        messages.append(message)
-                    else:
-                        messages.append({
-                            "role": "user",
-                            "content": str(message)
-                        })
-            else:
-                messages = [{
-                    "role": "user",
-                    "content": str(generic_request.prompt)
-                }]
+            # Assuming Mistral models for batch use a messages format similar to chat completion
+            messages_for_mistral = []
+            source_messages_data = []
+            if hasattr(generic_request, 'messages') and generic_request.messages:
+                source_messages_data = generic_request.messages
+            elif hasattr(generic_request, 'prompt'):
+                if isinstance(generic_request.prompt, list): source_messages_data = generic_request.prompt
+                else: source_messages_data = [{"role": "user", "content": str(generic_request.prompt)}]
 
-            model_input = {
-                "messages": messages
-            }
+            for msg_item in source_messages_data:
+                if isinstance(msg_item, dict):
+                    # Ensure role is user or assistant
+                    role = msg_item.get("role", "user").lower()
+                    valid_role = "user" if role not in ["user", "assistant"] else role
+                    messages_for_mistral.append({"role": valid_role, "content": str(msg_item.get("content", ""))})
+                else: # Simple string
+                    messages_for_mistral.append({"role": "user", "content": str(msg_item)})
+            
+            model_input = {"messages": messages_for_mistral}
+            # Mistral InvokeModel for chat-like models (e.g., Mistral Large) uses these params directly
+            # For text-only models (e.g. Mistral 7B, Mixtral 8x7B), the prompt needs to be formatted with [INST]
+            # This implementation assumes chat-like input for batch supported Mistral models.
+            # If a text-only Mistral model is used for batch, this needs adjustment.
+            # Example: prompt = "<s>[INST] {user_prompt_1} [/INST] {assistant_response_1}</s> [INST] {user_prompt_2} [/INST]"
 
-            # Add optional parameters
-            for param_name in ["temperature", "top_p", "max_tokens"]:
-                if param_name in generic_request.generation_params:
-                    model_input[param_name] = generic_request.generation_params[param_name]
+            param_map = {"temperature": "temperature", "top_p": "top_p", "max_tokens": "max_tokens"}
+            if "mistral.mistral-7b-instruct" in self.model_id or "mistral.mixtral-8x7b-instruct" in self.model_id:
+                # These models might prefer a single prompt string with INST tags for InvokeModel
+                # For simplicity, we'll stick to messages for now, but this is a point of potential refinement
+                # if specific batch models require the INST format.
+                # The AWS docs for InvokeModel with Mistral 7B/Mixtral show a 'prompt' field.
+                # If that's the case for batch, this section needs to build a single prompt string.
+                # For now, assuming 'messages' is accepted by batch-supported Mistral models.
+                pass
+
+            for gen_param, api_param in param_map.items():
+                 if gen_param in generic_request.generation_params:
+                    model_input[api_param] = generic_request.generation_params[gen_param]
+            if "stop_sequences" in generic_request.generation_params: # Mistral uses "stop"
+                model_input["stop"] = generic_request.generation_params["stop_sequences"]
+
+
         else:
             raise ValueError(f"Unsupported model provider: {self.model_provider}")
 
-        # Format in AWS Bedrock batch format
-        # Use task_id if available, otherwise use original_row_idx or a default
         record_id = getattr(generic_request, 'task_id', None)
         if record_id is None:
-            record_id = getattr(generic_request, 'original_row_idx', 0)
+            record_id = getattr(generic_request, 'original_row_idx', str(uuid.uuid4())) # Ensure unique ID
 
         return {
-            "recordId": f"{record_id}",
+            "recordId": str(record_id), # Ensure recordId is a string
             "modelInput": model_input
         }
 

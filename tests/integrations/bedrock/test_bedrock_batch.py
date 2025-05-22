@@ -50,6 +50,23 @@ skip_if_no_batch_config = pytest.mark.skipif(
 class TestBedrockBatchIntegration(unittest.TestCase):
     """Integration tests for the BedrockBatchRequestProcessor."""
 
+    def _generate_batch_test_data(self, num_entries: int, model_id: str) -> List[GenericRequest]:
+        """Helper to generate a list of GenericRequest objects for testing."""
+        requests = []
+        for i in range(num_entries):
+            prompt = f"This is test prompt number {i} for Bedrock batch processing. What is 2+2?"
+            requests.append(
+                GenericRequest(
+                    model=model_id,
+                    prompt=prompt,
+                    generation_params={"temperature": 0.7, "max_tokens": 50},
+                    original_row={"prompt": prompt, "index": i},
+                    original_row_idx=i,
+                    task_id=str(i) # Ensure task_id is a string
+                )
+            )
+        return requests
+
     @classmethod
     def setUpClass(cls):
         """Set up test fixtures for the entire test class."""
@@ -136,30 +153,40 @@ class TestBedrockBatchIntegration(unittest.TestCase):
 
     @pytest.mark.asyncio
     async def test_submit_batch(self):
-        """Test submitting a batch job to Bedrock."""
-        # Create a list of generic requests
-        requests = [
-            GenericRequest(
-                model=self.model_id,
-                prompt=f"What is AWS Bedrock? (Request {i})",
-                generation_params={"temperature": 0.7, "max_tokens": 100},
-                original_row={"prompt": f"What is AWS Bedrock? (Request {i})"},
-                original_row_idx=i,
-                task_id=i
-            )
-            for i in range(3)
-        ]
+        """Test submitting a batch job to Bedrock with >100 entries and <50MB size."""
+        num_test_entries = 105  # Test with more than 100 entries
+        requests = self._generate_batch_test_data(num_test_entries, self.model_id)
         
         # Convert to API-specific format
         api_requests = [
             self.processor.create_api_specific_request_batch(req)
             for req in requests
         ]
+
+        # Create a temporary file to check its size before S3 upload
+        # This mimics what submit_batch would do internally for the input file.
+        temp_input_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".jsonl", dir=self.temp_dir.name) as tmp_f:
+                for api_req in api_requests:
+                    tmp_f.write(json.dumps(api_req) + "\n")
+                temp_input_file_path = tmp_f.name
+            
+            self.assertIsNotNone(temp_input_file_path)
+            file_size_bytes = os.path.getsize(temp_input_file_path)
+            max_allowed_bytes = 50 * 1024 * 1024  # 50MB
+            self.assertLessEqual(file_size_bytes, max_allowed_bytes,
+                                 f"Generated input file size {file_size_bytes} exceeds {max_allowed_bytes} bytes.")
+            print(f"Generated test input file with {num_test_entries} entries, size: {file_size_bytes} bytes.")
+
+        finally:
+            if temp_input_file_path and os.path.exists(temp_input_file_path):
+                os.remove(temp_input_file_path)
         
-        # Submit the batch
+        # Submit the batch (actual S3 upload happens here)
         batch = await self.processor.submit_batch(
             requests=api_requests,
-            metadata={"test_id": "test_submit_batch"}
+            metadata={"test_id": "test_submit_batch_large"}
         )
         
         # Check that the batch was created successfully
@@ -188,16 +215,22 @@ class TestBedrockBatchIntegration(unittest.TestCase):
         responses = await self.processor.fetch_batch_results(batch)
         
         # Check that we got the expected number of responses
-        self.assertEqual(len(responses), len(requests))
+        self.assertEqual(len(responses), len(requests), "Number of responses did not match number of requests.")
         
         # Check that each response has the expected format
-        for response in responses:
-            self.assertIn("response", response)
-            self.assertTrue(response["response"])
+        for i, response_obj in enumerate(responses):
+            # Assuming GenericResponse objects are returned
+            self.assertIsInstance(response_obj, curator.types.generic_response.GenericResponse, f"Response {i} is not a GenericResponse object.")
+            self.assertTrue(response_obj.success, f"Response {i} was not successful: {response_obj.message}")
+            self.assertIsNotNone(response_obj.response, f"Response {i} content is None.")
+            self.assertTrue(len(response_obj.response) > 0, f"Response {i} content is empty.")
             
-            # Check that the response contains relevant information
-            self.assertIn("Bedrock", response["response"])
-            self.assertIn("AWS", response["response"])
+            # Check that the response contains relevant information (e.g., part of the prompt or expected answer)
+            # This part is model/prompt dependent. For "What is 2+2?", expect "4".
+            if "2+2" in requests[i].prompt: # Check if it was the math prompt
+                 self.assertIn("4", response_obj.response, f"Response {i} for '2+2' did not contain '4'. Got: {response_obj.response}")
+            elif "Bedrock" in requests[i].prompt: # Fallback for original prompt
+                 self.assertIn("Bedrock", response_obj.response, f"Response {i} for Bedrock prompt did not contain 'Bedrock'. Got: {response_obj.response}")
 
     @pytest.mark.asyncio
     async def test_multiple_models_batch(self):
@@ -304,27 +337,19 @@ class TestBedrockBatchIntegration(unittest.TestCase):
             }
         )
         
-        # Create a list of prompts
-        prompts = [
-            "What is AWS Bedrock?",
-            "What are foundation models?",
-            "How does batch processing work in AWS Bedrock?"
-        ]
+        # Create a list of prompts (at least 100)
+        num_llm_prompts = 102
+        prompts = [f"This is LLM integration test prompt {i}. Tell me a short story." for i in range(num_llm_prompts)]
         
         # Generate responses in batch mode
         responses = llm.generate_batch(prompts)
         
         # Check that we got the expected number of responses
-        self.assertEqual(len(responses), len(prompts))
+        self.assertEqual(len(responses), len(prompts), "Number of LLM batch responses did not match number of prompts.")
         
         # Check that each response has the expected format
-        for response in responses:
-            self.assertTrue(response)
-            
-            # Check that the response contains relevant information
-            if "Bedrock" in response:
-                self.assertIn("AWS", response)
-            elif "foundation models" in response:
-                self.assertIn("AI", response)
-            elif "batch processing" in response:
-                self.assertIn("AWS", response)
+        for i, response_text in enumerate(responses):
+            self.assertIsInstance(response_text, str, f"LLM Response {i} is not a string.")
+            self.assertTrue(len(response_text) > 0, f"LLM Response {i} is empty.")
+            # A simple check, could be more specific if prompts had expected keywords in answers
+            self.assertIn("story", response_text.lower(), f"LLM Response {i} did not seem to contain a story. Got: {response_text[:100]}...")
