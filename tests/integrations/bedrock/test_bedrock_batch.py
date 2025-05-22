@@ -74,13 +74,13 @@ class TestBedrockBatchIntegration(unittest.TestCase):
         cls.s3_bucket = os.environ.get("BEDROCK_BATCH_S3_BUCKET")
         cls.role_arn = os.environ.get("BEDROCK_BATCH_ROLE_ARN")
         cls.created_resources = {}
-        
+
         if not cls.s3_bucket or not cls.role_arn:
             # Create test resources
             cls.created_resources = setup_test_resources()
             cls.s3_bucket = cls.created_resources.get("s3_bucket")
             cls.role_arn = cls.created_resources.get("role_arn")
-            
+
             if not cls.s3_bucket or not cls.role_arn:
                 raise unittest.SkipTest("Failed to create required AWS resources")
 
@@ -97,17 +97,18 @@ class TestBedrockBatchIntegration(unittest.TestCase):
         self.model_id = os.environ.get("BEDROCK_TEST_MODEL", DEFAULT_CLAUDE_MODEL)
         self.region_name = os.environ.get("AWS_REGION", "us-east-1")
         self.s3_prefix = os.environ.get("BEDROCK_BATCH_S3_PREFIX", "curator-test")
-        
+
         # Create a temporary directory for working files
         self.temp_dir = tempfile.TemporaryDirectory()
-        
+
         # Create a config
         self.config = BatchRequestProcessorConfig(
             model=self.model_id,
             generation_params={"temperature": 0.7, "max_tokens": 100},
-            working_dir=self.temp_dir.name
+            working_dir=self.temp_dir.name,
+            timeout_hours=1  # Use a shorter timeout for tests
         )
-        
+
         # Create the processor
         self.processor = BedrockBatchRequestProcessor(
             config=self.config,
@@ -132,15 +133,15 @@ class TestBedrockBatchIntegration(unittest.TestCase):
             original_row_idx=0,
             task_id=1
         )
-        
+
         # Convert to API-specific format
         api_request = self.processor.create_api_specific_request_batch(generic_request)
-        
+
         # Check that the request has the expected format
         self.assertIn("recordId", api_request)
         self.assertIn("modelInput", api_request)
         self.assertEqual(api_request["recordId"], "1")  # Should use task_id
-        
+
         # Check model-specific formatting
         model_input = api_request["modelInput"]
         if "anthropic" in self.model_id:
@@ -156,7 +157,7 @@ class TestBedrockBatchIntegration(unittest.TestCase):
         """Test submitting a batch job to Bedrock with >100 entries and <50MB size."""
         num_test_entries = 105  # Test with more than 100 entries
         requests = self._generate_batch_test_data(num_test_entries, self.model_id)
-        
+
         # Convert to API-specific format
         api_requests = [
             self.processor.create_api_specific_request_batch(req)
@@ -171,7 +172,7 @@ class TestBedrockBatchIntegration(unittest.TestCase):
                 for api_req in api_requests:
                     tmp_f.write(json.dumps(api_req) + "\n")
                 temp_input_file_path = tmp_f.name
-            
+
             self.assertIsNotNone(temp_input_file_path)
             file_size_bytes = os.path.getsize(temp_input_file_path)
             max_allowed_bytes = 50 * 1024 * 1024  # 50MB
@@ -182,41 +183,41 @@ class TestBedrockBatchIntegration(unittest.TestCase):
         finally:
             if temp_input_file_path and os.path.exists(temp_input_file_path):
                 os.remove(temp_input_file_path)
-        
+
         # Submit the batch (actual S3 upload happens here)
         batch = await self.processor.submit_batch(
             requests=api_requests,
             metadata={"test_id": "test_submit_batch_large"}
         )
-        
+
         # Check that the batch was created successfully
         self.assertIsNotNone(batch)
         self.assertIsNotNone(batch.batch_id)
         self.assertIsNotNone(batch.provider_batch_id)
         self.assertEqual(batch.status, GenericBatchStatus.PROCESSING)
-        
+
         # Wait for the batch to complete (with timeout)
-        timeout = 300  # 5 minutes
+        timeout = self.config.timeout_hours * 3600  # Convert hours to seconds
         start_time = time.time()
         while batch.status == GenericBatchStatus.PROCESSING:
             if time.time() - start_time > timeout:
-                self.fail("Batch processing timed out")
-            
+                self.fail(f"Batch processing timed out after {timeout} seconds")
+
             # Wait a bit before checking again
             time.sleep(10)
-            
+
             # Check batch status
             batch = await self.processor.get_batch_status(batch)
-        
+
         # Check that the batch completed successfully
         self.assertEqual(batch.status, GenericBatchStatus.COMPLETE)
-        
+
         # Fetch the results
         responses = await self.processor.fetch_batch_results(batch)
-        
+
         # Check that we got the expected number of responses
         self.assertEqual(len(responses), len(requests), "Number of responses did not match number of requests.")
-        
+
         # Check that each response has the expected format
         for i, response_obj in enumerate(responses):
             # Assuming GenericResponse objects are returned
@@ -224,7 +225,7 @@ class TestBedrockBatchIntegration(unittest.TestCase):
             self.assertTrue(response_obj.success, f"Response {i} was not successful: {response_obj.message}")
             self.assertIsNotNone(response_obj.response, f"Response {i} content is None.")
             self.assertTrue(len(response_obj.response) > 0, f"Response {i} content is empty.")
-            
+
             # Check that the response contains relevant information (e.g., part of the prompt or expected answer)
             # This part is model/prompt dependent. For "What is 2+2?", expect "4".
             if "2+2" in requests[i].prompt: # Check if it was the math prompt
@@ -238,7 +239,7 @@ class TestBedrockBatchIntegration(unittest.TestCase):
         # Skip if we don't have access to Llama model
         if not check_bedrock_access(DEFAULT_LLAMA_MODEL):
             self.skipTest(f"No access to {DEFAULT_LLAMA_MODEL}")
-        
+
         # Create requests for different models
         requests = [
             # Claude request
@@ -260,7 +261,7 @@ class TestBedrockBatchIntegration(unittest.TestCase):
                 task_id=2
             )
         ]
-        
+
         # Process each request with its own processor
         results = []
         for req in requests:
@@ -270,7 +271,7 @@ class TestBedrockBatchIntegration(unittest.TestCase):
                 generation_params=req.generation_params,
                 working_dir=self.temp_dir.name
             )
-            
+
             processor = BedrockBatchRequestProcessor(
                 config=config,
                 region_name=self.region_name,
@@ -278,49 +279,94 @@ class TestBedrockBatchIntegration(unittest.TestCase):
                 s3_prefix=f"{self.s3_prefix}/{req.model}",
                 role_arn=self.role_arn
             )
-            
+
             # Convert to API-specific format
             api_request = processor.create_api_specific_request_batch(req)
-            
+
             # Submit the batch
             batch = await processor.submit_batch(
                 requests=[api_request],
                 metadata={"test_id": "test_multiple_models_batch", "model": req.model}
             )
-            
+
             # Wait for the batch to complete (with timeout)
-            timeout = 300  # 5 minutes
+            timeout = config.timeout_hours * 3600  # Convert hours to seconds
             start_time = time.time()
             while batch.status == GenericBatchStatus.PROCESSING:
                 if time.time() - start_time > timeout:
-                    self.fail(f"Batch processing timed out for model {req.model}")
-                
+                    self.fail(f"Batch processing timed out for model {req.model} after {timeout} seconds")
+
                 # Wait a bit before checking again
                 time.sleep(10)
-                
+
                 # Check batch status
                 batch = await processor.get_batch_status(batch)
-            
+
             # Check that the batch completed successfully
             self.assertEqual(batch.status, GenericBatchStatus.COMPLETE)
-            
+
             # Fetch the results
             responses = await processor.fetch_batch_results(batch)
-            
+
             # Add to results
             results.extend(responses)
-        
+
         # Check that we got the expected number of responses
         self.assertEqual(len(results), len(requests))
-        
+
         # Check that each response has the expected format
         for response in results:
             self.assertIn("response", response)
             self.assertTrue(response["response"])
-            
+
             # Check that the response contains relevant information
             self.assertIn("Bedrock", response["response"])
             self.assertIn("AWS", response["response"])
+
+    @pytest.mark.asyncio
+    async def test_monitor_batch_job(self):
+        """Test the monitor_batch_job method for waiting for batch completion."""
+        # Create a small batch for testing
+        num_test_entries = 5
+        requests = self._generate_batch_test_data(num_test_entries, self.model_id)
+
+        # Convert to API-specific format
+        api_requests = [
+            self.processor.create_api_specific_request_batch(req)
+            for req in requests
+        ]
+
+        # Submit the batch
+        batch = await self.processor.submit_batch(
+            requests=api_requests,
+            metadata={"test_id": "test_monitor_batch_job"}
+        )
+
+        # Check that the batch was created successfully
+        self.assertIsNotNone(batch)
+        self.assertIsNotNone(batch.batch_id)
+        self.assertIsNotNone(batch.provider_batch_id)
+        self.assertEqual(batch.status, GenericBatchStatus.PROCESSING)
+
+        # Use monitor_batch_job to wait for completion
+        try:
+            # Use a shorter timeout for testing
+            timeout_seconds = 300  # 5 minutes
+            batch = await self.processor.monitor_batch_job(batch, timeout_seconds)
+
+            # Check that the batch completed successfully
+            self.assertEqual(batch.status, GenericBatchStatus.COMPLETE)
+
+            # Fetch the results
+            responses = await self.processor.fetch_batch_results(batch)
+
+            # Check that we got the expected number of responses
+            self.assertEqual(len(responses), len(requests))
+
+        except TimeoutError:
+            self.fail("Batch monitoring timed out")
+        except Exception as e:
+            self.fail(f"Error monitoring batch: {str(e)}")
 
     def test_llm_integration(self):
         """Test integration with the LLM class for batch processing."""
@@ -333,20 +379,21 @@ class TestBedrockBatchIntegration(unittest.TestCase):
             batch_params={
                 "s3_bucket": self.s3_bucket,
                 "s3_prefix": self.s3_prefix,
-                "role_arn": self.role_arn
+                "role_arn": self.role_arn,
+                "timeout_hours": self.config.timeout_hours
             }
         )
-        
+
         # Create a list of prompts (at least 100)
         num_llm_prompts = 102
         prompts = [f"This is LLM integration test prompt {i}. Tell me a short story." for i in range(num_llm_prompts)]
-        
+
         # Generate responses in batch mode
         responses = llm.generate_batch(prompts)
-        
+
         # Check that we got the expected number of responses
         self.assertEqual(len(responses), len(prompts), "Number of LLM batch responses did not match number of prompts.")
-        
+
         # Check that each response has the expected format
         for i, response_text in enumerate(responses):
             self.assertIsInstance(response_text, str, f"LLM Response {i} is not a string.")

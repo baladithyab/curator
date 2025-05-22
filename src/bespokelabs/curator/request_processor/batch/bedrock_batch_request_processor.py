@@ -203,6 +203,9 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
         # Timeout and monitoring configuration
         self.timeout_hours = getattr(config, "timeout_hours", 24)  # Default timeout in hours
+        # Also check generation_params for timeout_hours
+        if hasattr(config, "generation_params") and config.generation_params and "timeout_hours" in config.generation_params:
+            self.timeout_hours = config.generation_params["timeout_hours"]
         self.monitoring_interval = getattr(config, "monitoring_interval", 300)  # Default: check every 5 minutes
         self.batch_jobs = {}  # Track batch jobs: {batch_id: job_details}
 
@@ -646,7 +649,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                             current_system_text = current_system_text.strip()
                         else: # Simple string
                             current_system_text = str(content).strip()
-                        
+
                         if system_prompt is None:
                             system_prompt = current_system_text
                         else:
@@ -660,7 +663,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                         formatted_content_blocks = [{"type": "text", "text": content}]
                     else:
                         formatted_content_blocks = [{"type": "text", "text": str(content)}]
-                    
+
                     valid_role = "user" if role != "assistant" else "assistant"
                     messages.append({"role": valid_role, "content": formatted_content_blocks})
                 else: # Simple string in list
@@ -676,7 +679,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             }
             if system_prompt:
                 model_input["system"] = system_prompt
-            
+
             for param_name in ["temperature", "top_p", "top_k", "stop_sequences"]:
                 if param_name in generic_request.generation_params:
                     model_input[param_name] = generic_request.generation_params[param_name]
@@ -718,7 +721,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 for gen_param, bedrock_param in param_map.items():
                     if gen_param in generic_request.generation_params:
                         text_gen_config[bedrock_param] = generic_request.generation_params[gen_param]
-                
+
                 input_text = ""
                 if hasattr(generic_request, 'messages') and generic_request.messages:
                     # Concatenate user messages for Titan text models
@@ -733,7 +736,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     input_text = "\n".join(user_texts)
                 elif hasattr(generic_request, 'prompt'):
                     input_text = str(generic_request.prompt)
-                
+
                 model_input = {
                     "inputText": input_text,
                     "textGenerationConfig": text_gen_config
@@ -772,12 +775,12 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     # Infer role if not the first message and previous was user
                     if processed_messages_for_llama and processed_messages_for_llama[-1]["role"] == "user":
                         role = "assistant"
-                
+
                 if role == "system":
                     if system_message_content is None: system_message_content = content_text
                     else: system_message_content += "\n" + content_text
                     continue
-                
+
                 # Ensure role is user or assistant for Llama template
                 valid_llama_role = "user" if role != "assistant" else "assistant"
                 processed_messages_for_llama.append({"role": valid_llama_role, "content": content_text})
@@ -834,7 +837,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     last_msg_data = source_messages_data[-1]
                     if isinstance(last_msg_data, dict): query = str(last_msg_data.get("content", ""))
                     else: query = str(last_msg_data)
-                    
+
                     # Previous messages form chat history
                     for msg_data in source_messages_data[:-1]:
                         role = "USER"
@@ -846,7 +849,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                             role = "CHATBOT" if len(chat_history) > 0 and chat_history[-1]["role"] == "USER" else "USER"
                             message_text = str(msg_data)
                         chat_history.append({"role": role, "message": message_text})
-                
+
                 model_input = {"message": query, "chat_history": chat_history}
             else: # Older Cohere Command
                 prompt_text = str(generic_request.prompt)
@@ -869,7 +872,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             for gen_param, api_param in param_map.items():
                 if gen_param in generic_request.generation_params:
                     model_input[api_param] = generic_request.generation_params[gen_param]
-        
+
         elif self.model_provider == "ai21":
             if "jamba" in self.model_id.lower():
                 messages_for_jamba = []
@@ -920,7 +923,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     messages_for_mistral.append({"role": valid_role, "content": str(msg_item.get("content", ""))})
                 else: # Simple string
                     messages_for_mistral.append({"role": "user", "content": str(msg_item)})
-            
+
             model_input = {"messages": messages_for_mistral}
             # Mistral InvokeModel for chat-like models (e.g., Mistral Large) uses these params directly
             # For text-only models (e.g. Mistral 7B, Mixtral 8x7B), the prompt needs to be formatted with [INST]

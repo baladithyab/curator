@@ -70,6 +70,7 @@ class BatchRequestProcessorConfig(RequestProcessorConfig):
         delete_successful_batch_files: Whether to delete batch files after successful processing
         delete_failed_batch_files: Whether to delete batch files after failed processing
         completion_window: Time window to wait for batch completion
+        timeout_hours: Maximum time in hours to wait for batch completion (default: 24)
     """
 
     batch_size: t.Union[int, str] = Field(default=10_000)
@@ -77,6 +78,7 @@ class BatchRequestProcessorConfig(RequestProcessorConfig):
     delete_successful_batch_files: bool = False
     delete_failed_batch_files: bool = False
     completion_window: str = "24h"
+    timeout_hours: int = Field(default=24, gt=0)
 
     def __post_init__(self):
         """Post-initialization hook to validate batch size."""
@@ -165,6 +167,7 @@ class BatchBackendParams(BaseBackendParams, total=False):
     batch_check_interval: t.Optional[int]
     delete_successful_batch_files: t.Optional[bool]
     delete_failed_batch_files: t.Optional[bool]
+    timeout_hours: t.Optional[int]
 
 
 class OfflineBackendParams(BaseBackendParams, total=False):
