@@ -1011,6 +1011,11 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                 s3_output_uri = f"s3://{self.s3_bucket}/{self.s3_prefix}/output/{batch_id}/"
 
                 # Prepare job parameters with cost optimization settings
+                # AWS Bedrock requires a minimum timeout of 24 hours
+                timeout_hours = max(24, self.timeout_hours)
+                if timeout_hours != self.timeout_hours:
+                    logger.warning(f"Adjusted timeout from {self.timeout_hours} to {timeout_hours} hours (AWS Bedrock minimum)")
+
                 job_params = {
                     "jobName": f"curator-batch-{batch_id}",
                     "modelId": self.model_id,
@@ -1025,7 +1030,7 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                             "s3Uri": s3_output_uri
                         }
                     },
-                    "timeoutDurationInHours": self.timeout_hours
+                    "timeoutDurationInHours": timeout_hours
                 }
 
                 # Add cost optimization parameters if available
@@ -1382,12 +1387,16 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             # Remove batch from tracking
             self.batch_jobs.pop(batch.batch_id, None)
 
-    async def monitor_batch_job(self, batch: GenericBatch, timeout_seconds: int = None) -> GenericBatch:
+    async def monitor_batch_job(self, batch: GenericBatch, timeout_seconds: int = None,
+                            verbose: bool = True, progress_callback = None) -> GenericBatch:
         """Monitor a batch job until completion or timeout.
 
         Args:
             batch: The batch to monitor
             timeout_seconds: Optional timeout in seconds (overrides self.timeout_hours)
+            verbose: Whether to print progress information to stdout
+            progress_callback: Optional callback function to receive progress updates
+                               Function signature: callback(batch, elapsed_time, total_time, status_info)
 
         Returns:
             GenericBatch: Updated batch object with final status
@@ -1400,6 +1409,30 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
 
         start_time = time.time()
         check_interval = self.monitoring_interval  # Start with the default interval
+        last_progress_time = 0  # Track when we last reported progress
+        progress_interval = 60  # Report progress every minute by default
+
+        # Initial status check and progress report
+        updated_batch = await self.retrieve_batch(batch)
+        if updated_batch:
+            batch = updated_batch
+
+        if verbose:
+            print(f"Monitoring batch job {batch.batch_id} (timeout: {timeout_seconds/3600:.1f} hours)")
+            print(f"Initial status: {batch.status}")
+            if batch.metadata and isinstance(batch.metadata, dict):
+                bedrock_status = batch.metadata.get("bedrock_status", "Unknown")
+                print(f"Bedrock status: {bedrock_status}")
+
+        # Call progress callback if provided
+        if progress_callback:
+            status_info = {
+                "status": batch.status,
+                "bedrock_status": batch.metadata.get("bedrock_status", "Unknown") if batch.metadata else "Unknown",
+                "check_interval": check_interval,
+                "progress": 0.0  # Initial progress
+            }
+            progress_callback(batch, 0, timeout_seconds, status_info)
 
         while True:
             # Check if we've exceeded the timeout
@@ -1423,6 +1456,21 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
                     "elapsed_seconds": elapsed_time
                 })
 
+                # Final progress report
+                if verbose:
+                    print(f"\nBatch job {batch.batch_id} timed out after {elapsed_time/3600:.2f} hours")
+
+                # Call progress callback with final status
+                if progress_callback:
+                    status_info = {
+                        "status": batch.status,
+                        "bedrock_status": "Timeout",
+                        "check_interval": check_interval,
+                        "progress": 1.0,  # Complete but failed
+                        "error": "Timeout"
+                    }
+                    progress_callback(batch, elapsed_time, timeout_seconds, status_info)
+
                 raise TimeoutError(f"Batch job {batch.batch_id} timed out after {elapsed_time:.1f} seconds")
 
             # Retrieve current status
@@ -1435,21 +1483,84 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             # Update our batch object with the latest info
             batch = updated_batch
 
+            # Get Bedrock-specific status for more detailed reporting
+            bedrock_status = "Unknown"
+            if batch.metadata and isinstance(batch.metadata, dict):
+                bedrock_status = batch.metadata.get("bedrock_status", "Unknown")
+
             # Check if the job has completed or failed
             if batch.status in [GenericBatchStatus.COMPLETE, GenericBatchStatus.FAILED]:
                 logger.info(f"Batch job {batch.batch_id} finished with status: {batch.status}")
+
+                # Final progress report
+                if verbose:
+                    print(f"\nBatch job {batch.batch_id} finished with status: {batch.status}")
+                    print(f"Bedrock status: {bedrock_status}")
+                    print(f"Total time: {elapsed_time/3600:.2f} hours")
+                    if batch.status == GenericBatchStatus.FAILED and batch.metadata and "failure_reason" in batch.metadata:
+                        print(f"Failure reason: {batch.metadata['failure_reason']}")
+
+                # Call progress callback with final status
+                if progress_callback:
+                    status_info = {
+                        "status": batch.status,
+                        "bedrock_status": bedrock_status,
+                        "check_interval": check_interval,
+                        "progress": 1.0,  # Complete
+                        "failure_reason": batch.metadata.get("failure_reason") if batch.status == GenericBatchStatus.FAILED and batch.metadata else None
+                    }
+                    progress_callback(batch, elapsed_time, timeout_seconds, status_info)
+
                 return batch
 
             # Adjust check interval based on elapsed time for efficiency
             # For longer-running jobs, we don't need to check as frequently
             if elapsed_time > 3600:  # After 1 hour
                 check_interval = min(600, self.monitoring_interval * 2)  # Max 10 minutes
+                progress_interval = 300  # Report progress every 5 minutes
             elif elapsed_time > 600:  # After 10 minutes
                 check_interval = min(300, self.monitoring_interval * 1.5)  # Max 5 minutes
+                progress_interval = 180  # Report progress every 3 minutes
 
-            # Log progress periodically
-            if elapsed_time % 600 < check_interval:  # Log approximately every 10 minutes
-                logger.info(f"Batch job {batch.batch_id} still running after {elapsed_time:.1f} seconds")
+            # Report progress if enough time has passed since last report
+            current_time = time.time()
+            if current_time - last_progress_time >= progress_interval:
+                # Calculate progress percentage (estimate based on elapsed time)
+                progress_pct = min(95.0, (elapsed_time / timeout_seconds) * 100)
+
+                # Log progress
+                logger.info(f"Batch job {batch.batch_id} still running after {elapsed_time:.1f} seconds (status: {bedrock_status})")
+
+                # Print progress if verbose
+                if verbose:
+                    hours = int(elapsed_time // 3600)
+                    minutes = int((elapsed_time % 3600) // 60)
+                    seconds = int(elapsed_time % 60)
+                    time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+                    # Estimate remaining time
+                    if elapsed_time > 0:
+                        remaining_seconds = timeout_seconds - elapsed_time
+                        r_hours = int(remaining_seconds // 3600)
+                        r_minutes = int((remaining_seconds % 3600) // 60)
+                        remaining_str = f"{r_hours:02d}:{r_minutes:02d}:00"
+                    else:
+                        remaining_str = "Unknown"
+
+                    print(f"\rProgress: {progress_pct:.1f}% | Elapsed: {time_str} | Remaining: {remaining_str} | Status: {bedrock_status}", end="")
+
+                # Call progress callback if provided
+                if progress_callback:
+                    status_info = {
+                        "status": batch.status,
+                        "bedrock_status": bedrock_status,
+                        "check_interval": check_interval,
+                        "progress": progress_pct / 100.0,
+                        "elapsed_time_str": f"{int(elapsed_time // 3600):02d}:{int((elapsed_time % 3600) // 60):02d}:{int(elapsed_time % 60):02d}"
+                    }
+                    progress_callback(batch, elapsed_time, timeout_seconds, status_info)
+
+                last_progress_time = current_time
 
             # Wait before checking again
             await asyncio.sleep(check_interval)
