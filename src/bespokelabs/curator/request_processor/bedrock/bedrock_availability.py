@@ -56,6 +56,50 @@ CROSS_REGION_PREFIXES: Dict[str, List[str]] = {
 
 
 @dataclass
+class BedrockQuotas:
+    """Bedrock service quotas for batch inference."""
+
+    max_records_per_batch_job: int = 50_000
+    min_records_per_batch_job: int = 1
+    max_records_per_input_file: int = 50_000
+    max_input_file_size_bytes: int = 1 * 1024 * 1024 * 1024  # 1 GB
+    max_batch_job_size_bytes: int = 10 * 1024 * 1024 * 1024  # 10 GB
+    max_concurrent_batch_jobs: int = 10
+
+    @classmethod
+    def get_default(cls) -> "BedrockQuotas":
+        """Get default quota values."""
+        return cls()
+
+
+@dataclass
+class BedrockModelQuotas:
+    """Model-specific quotas for online inference.
+
+    These quotas are per-model and may vary by region.
+    """
+
+    model_id: str
+    requests_per_minute: int = 100  # Conservative default RPM
+    tokens_per_minute: int = 300_000  # Conservative default TPM
+    region: Optional[str] = None
+
+    @classmethod
+    def get_default(cls, model_id: str, region: Optional[str] = None) -> "BedrockModelQuotas":
+        """Get default quota values for a model.
+
+        Uses static fallback quotas based on known model defaults.
+        """
+        defaults = _get_static_model_quotas(model_id, region)
+        return cls(
+            model_id=model_id,
+            requests_per_minute=defaults.get("rpm", 100),
+            tokens_per_minute=defaults.get("tpm", 300_000),
+            region=region,
+        )
+
+
+@dataclass
 class BedrockModelInfo:
     """Information about a Bedrock model."""
 
@@ -108,8 +152,12 @@ class BedrockAvailabilityManager:
         self.region = region or os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
         self.profile = profile or os.getenv("AWS_PROFILE")
         self._bedrock_client = None
+        self._service_quotas_client = None
         self._models_cache: Dict[str, BedrockModelInfo] = {}
         self._converse_supported_cache: Dict[str, bool] = {}
+        self._quotas_cache: Optional[BedrockQuotas] = None
+        self._model_quotas_cache: Dict[str, BedrockModelQuotas] = {}
+        self._quota_name_to_model_cache: Optional[Dict[str, str]] = None
 
     @property
     def bedrock_client(self):
@@ -132,6 +180,28 @@ class BedrockAvailabilityManager:
                 region_name=self.region,
             )
         return self._bedrock_client
+
+    @property
+    def service_quotas_client(self):
+        """Lazily initialize the Service Quotas client."""
+        if self._service_quotas_client is None:
+            try:
+                import boto3
+            except ImportError as e:
+                raise ImportError(
+                    "boto3 is required for Bedrock support. Install with: pip install boto3"
+                ) from e
+
+            session_kwargs = {}
+            if self.profile:
+                session_kwargs["profile_name"] = self.profile
+
+            session = boto3.Session(**session_kwargs)
+            self._service_quotas_client = session.client(
+                "service-quotas",
+                region_name=self.region,
+            )
+        return self._service_quotas_client
 
     def list_foundation_models(self, refresh: bool = False) -> Dict[str, BedrockModelInfo]:
         """List all available foundation models in the current region.
@@ -306,6 +376,232 @@ class BedrockAvailabilityManager:
 
         return batch_models
 
+    def get_batch_quotas(self, refresh: bool = False) -> BedrockQuotas:
+        """Get Bedrock batch inference quotas dynamically from Service Quotas API.
+
+        Falls back to static defaults if API call fails.
+
+        Args:
+            refresh: Force refresh the cache
+
+        Returns:
+            BedrockQuotas with current quota values
+        """
+        if self._quotas_cache is not None and not refresh:
+            return self._quotas_cache
+
+        quotas = BedrockQuotas.get_default()
+
+        try:
+            # List all Bedrock quotas
+            paginator = self.service_quotas_client.get_paginator("list_service_quotas")
+
+            for page in paginator.paginate(ServiceCode="bedrock"):
+                for quota in page.get("Quotas", []):
+                    quota_name = quota.get("QuotaName", "").lower()
+                    quota_value = quota.get("Value")
+
+                    if quota_value is None:
+                        continue
+
+                    # Match batch-related quotas by name patterns
+                    if "batch inference" in quota_name or "batch job" in quota_name:
+                        if "records per" in quota_name and "job" in quota_name:
+                            if "minimum" in quota_name:
+                                quotas.min_records_per_batch_job = int(quota_value)
+                            elif "input file" in quota_name:
+                                quotas.max_records_per_input_file = int(quota_value)
+                            else:
+                                quotas.max_records_per_batch_job = int(quota_value)
+                        elif "file size" in quota_name or "input file size" in quota_name:
+                            # Convert to bytes if needed (quota might be in MB or GB)
+                            quotas.max_input_file_size_bytes = int(quota_value)
+                        elif "job size" in quota_name:
+                            quotas.max_batch_job_size_bytes = int(quota_value)
+                        elif "concurrent" in quota_name:
+                            quotas.max_concurrent_batch_jobs = int(quota_value)
+
+            logger.debug(f"Loaded Bedrock quotas from Service Quotas API: {quotas}")
+
+        except Exception as e:
+            logger.debug(f"Failed to retrieve quotas from Service Quotas API: {e}. Using defaults.")
+
+        self._quotas_cache = quotas
+        return quotas
+
+    def get_quota_value(self, quota_code: str) -> Optional[float]:
+        """Get a specific quota value by its code.
+
+        Args:
+            quota_code: The Service Quotas quota code (e.g., 'L-XXXXXXXX')
+
+        Returns:
+            The quota value or None if not found
+        """
+        try:
+            response = self.service_quotas_client.get_service_quota(
+                ServiceCode="bedrock",
+                QuotaCode=quota_code,
+            )
+            return response.get("Quota", {}).get("Value")
+        except Exception as e:
+            logger.debug(f"Failed to get quota {quota_code}: {e}")
+            return None
+
+    def get_model_quotas(self, model_id: str, refresh: bool = False) -> BedrockModelQuotas:
+        """Get model-specific quotas for online inference.
+
+        Attempts to retrieve RPM/TPM quotas from Service Quotas API with static fallbacks.
+
+        Args:
+            model_id: The Bedrock model ID
+            refresh: Force refresh the cache
+
+        Returns:
+            BedrockModelQuotas with RPM and TPM values
+        """
+        cache_key = f"{model_id}:{self.region}"
+        if cache_key in self._model_quotas_cache and not refresh:
+            return self._model_quotas_cache[cache_key]
+
+        # Start with static defaults
+        quotas = BedrockModelQuotas.get_default(model_id, self.region)
+
+        try:
+            # Get model-friendly name for quota matching
+            model_name = self._get_model_friendly_name(model_id)
+            if not model_name:
+                self._model_quotas_cache[cache_key] = quotas
+                return quotas
+
+            # Search through quotas for matching model
+            paginator = self.service_quotas_client.get_paginator("list_service_quotas")
+
+            rpm_found = False
+            tpm_found = False
+
+            for page in paginator.paginate(ServiceCode="bedrock"):
+                for quota in page.get("Quotas", []):
+                    quota_name = quota.get("QuotaName", "")
+                    quota_value = quota.get("Value")
+
+                    if quota_value is None:
+                        continue
+
+                    quota_name_lower = quota_name.lower()
+
+                    # Check if quota matches this model
+                    # Quota names look like:
+                    # "On-demand model inference requests per minute for Anthropic Claude 3 Haiku"
+                    # "On-demand model inference tokens per minute for Anthropic Claude 3 Haiku"
+                    if model_name.lower() in quota_name_lower:
+                        if "requests per minute" in quota_name_lower and "on-demand" in quota_name_lower:
+                            quotas.requests_per_minute = int(quota_value)
+                            rpm_found = True
+                        elif "tokens per minute" in quota_name_lower and "on-demand" in quota_name_lower:
+                            quotas.tokens_per_minute = int(quota_value)
+                            tpm_found = True
+
+                    if rpm_found and tpm_found:
+                        break
+
+                if rpm_found and tpm_found:
+                    break
+
+            if rpm_found or tpm_found:
+                logger.debug(
+                    f"Loaded quotas for {model_id} from Service Quotas API: "
+                    f"RPM={quotas.requests_per_minute}, TPM={quotas.tokens_per_minute}"
+                )
+
+        except Exception as e:
+            logger.debug(f"Failed to retrieve model quotas from Service Quotas API: {e}. Using defaults.")
+
+        self._model_quotas_cache[cache_key] = quotas
+        return quotas
+
+    def _get_model_friendly_name(self, model_id: str) -> Optional[str]:
+        """Convert model ID to friendly name for quota matching.
+
+        Args:
+            model_id: The Bedrock model ID (e.g., 'anthropic.claude-3-haiku-20240307-v1:0')
+
+        Returns:
+            Friendly name for quota matching (e.g., 'Anthropic Claude 3 Haiku')
+        """
+        # Map common model ID patterns to quota-friendly names
+        model_name_mappings = {
+            # Anthropic Claude
+            "anthropic.claude-3-haiku": "Anthropic Claude 3 Haiku",
+            "anthropic.claude-3-sonnet": "Anthropic Claude 3 Sonnet",
+            "anthropic.claude-3-opus": "Anthropic Claude 3 Opus",
+            "anthropic.claude-3-5-sonnet-20240620": "Anthropic Claude 3.5 Sonnet",
+            "anthropic.claude-3-5-sonnet-20241022": "Anthropic Claude 3.5 Sonnet V2",
+            "anthropic.claude-3-5-haiku": "Anthropic Claude 3.5 Haiku",
+            "anthropic.claude-3-7-sonnet": "Anthropic Claude 3.7 Sonnet",
+            "anthropic.claude-instant": "Anthropic Claude Instant",
+            "anthropic.claude-v2": "Anthropic Claude V2",
+            # Amazon Nova
+            "amazon.nova-micro": "Amazon Nova Micro",
+            "amazon.nova-lite": "Amazon Nova Lite",
+            "amazon.nova-pro": "Amazon Nova Pro",
+            "amazon.nova-canvas": "Amazon Nova Canvas",
+            "amazon.nova-premier": "Amazon Nova Premier",
+            # Amazon Titan
+            "amazon.titan-text-express": "Amazon Titan Text Express",
+            "amazon.titan-text-lite": "Amazon Titan Text Lite",
+            "amazon.titan-text-premier": "Amazon Titan Text Premier",
+            "amazon.titan-embed-text-v1": "Amazon Titan Text Embeddings",
+            "amazon.titan-embed-text-v2": "Amazon Titan Text Embeddings V2",
+            "amazon.titan-embed-image": "Amazon Titan Multimodal Embeddings",
+            "amazon.titan-image-generator-v1": "Amazon Titan Image Generator G1",
+            "amazon.titan-image-generator-v2": "Amazon Titan Image Generator G1 V2",
+            # Meta Llama
+            "meta.llama2-13b-chat": "Meta Llama 2 Chat 13B",
+            "meta.llama2-70b-chat": "Meta Llama 2 Chat 70B",
+            "meta.llama3-8b-instruct": "Meta Llama 3 8B Instruct",
+            "meta.llama3-70b-instruct": "Meta Llama 3 70B Instruct",
+            "meta.llama3-1-8b-instruct": "Meta Llama 3.1 8B Instruct",
+            "meta.llama3-1-70b-instruct": "Meta Llama 3.1 70B Instruct",
+            "meta.llama3-1-405b-instruct": "Meta Llama 3.1 405B Instruct",
+            "meta.llama3-2-1b-instruct": "Meta Llama 3.2 1B Instruct",
+            "meta.llama3-2-3b-instruct": "Meta Llama 3.2 3B Instruct",
+            "meta.llama3-2-11b-instruct": "Meta Llama 3.2 11B Instruct",
+            "meta.llama3-2-90b-instruct": "Meta Llama 3.2 90B Instruct",
+            "meta.llama3-3-70b-instruct": "Meta Llama 3.3 70B Instruct",
+            # Mistral
+            "mistral.mistral-7b-instruct": "Mistral 7B Instruct",
+            "mistral.mixtral-8x7b-instruct": "Mistral Mixtral 8x7b Instruct",
+            "mistral.mistral-large-2402": "Mistral Large",
+            "mistral.mistral-large-2407": "Mistral Large 2407",
+            "mistral.mistral-small-2402": "Mistral AI Mistral Small",
+            # Cohere
+            "cohere.command-r-v1": "Cohere Command R",
+            "cohere.command-r-plus": "Cohere Command R Plus",
+            "cohere.command-text": "Cohere Command",
+            "cohere.command-light": "Cohere Command Light",
+            "cohere.embed-english": "Cohere Embed English",
+            "cohere.embed-multilingual": "Cohere Embed Multilingual",
+            # AI21
+            "ai21.jamba-instruct": "AI21 Labs Jamba Instruct",
+            "ai21.jamba-1-5-large": "AI21 Labs Jamba 1.5 Large",
+            "ai21.jamba-1-5-mini": "AI21 Labs Jamba 1.5 Mini",
+            "ai21.j2-ultra": "AI21 Labs Jurassic-2 Ultra",
+            "ai21.j2-mid": "AI21 Labs Jurassic-2 Mid",
+        }
+
+        # Try exact prefix match first
+        for pattern, friendly_name in model_name_mappings.items():
+            if model_id.startswith(pattern):
+                return friendly_name
+
+        # Try partial match
+        for pattern, friendly_name in model_name_mappings.items():
+            if pattern in model_id:
+                return friendly_name
+
+        return None
+
 
 # Regions where batch inference is available
 BATCH_INFERENCE_REGIONS: List[str] = [
@@ -417,6 +713,175 @@ _STATIC_INVOKE_MODEL_ONLY: Set[str] = {
     "openai.gpt-oss-120b-1:0",
     "openai.gpt-oss-20b-1:0",
 }
+
+# Static model quotas for online inference (RPM/TPM) with region overrides
+# Format: model_pattern -> {default: {rpm, tpm}, region_overrides: {region: {rpm, tpm}}}
+_STATIC_MODEL_QUOTAS: Dict[str, Dict] = {
+    # Anthropic Claude models
+    "anthropic.claude-3-haiku": {
+        "default": {"rpm": 400, "tpm": 300_000},
+        "regions": {
+            "us-east-1": {"rpm": 1000, "tpm": 2_000_000},
+            "us-west-2": {"rpm": 1000, "tpm": 2_000_000},
+            "ap-northeast-1": {"rpm": 200, "tpm": 200_000},
+            "ap-southeast-1": {"rpm": 200, "tpm": 200_000},
+        },
+    },
+    "anthropic.claude-3-sonnet": {
+        "default": {"rpm": 100, "tpm": 200_000},
+        "regions": {
+            "us-east-1": {"rpm": 500, "tpm": 1_000_000},
+            "us-west-2": {"rpm": 500, "tpm": 1_000_000},
+        },
+    },
+    "anthropic.claude-3-opus": {
+        "default": {"rpm": 50, "tpm": 400_000},
+    },
+    "anthropic.claude-3-5-sonnet": {
+        "default": {"rpm": 50, "tpm": 400_000},
+        "regions": {
+            "us-west-2": {"rpm": 250, "tpm": 2_000_000},
+            "us-east-1": {"rpm": 50, "tpm": 400_000},
+            "us-east-2": {"rpm": 50, "tpm": 400_000},
+        },
+    },
+    "anthropic.claude-3-5-haiku": {
+        "default": {"rpm": 1000, "tpm": 2_000_000},
+        "regions": {
+            "us-west-1": {"rpm": 400, "tpm": 300_000},
+        },
+    },
+    "anthropic.claude-3-7-sonnet": {
+        "default": {"rpm": 125, "tpm": 500_000},
+    },
+    "anthropic.claude-instant": {
+        "default": {"rpm": 400, "tpm": 300_000},
+        "regions": {
+            "us-east-1": {"rpm": 1000, "tpm": 1_000_000},
+            "us-west-2": {"rpm": 1000, "tpm": 1_000_000},
+        },
+    },
+    # Amazon Nova models
+    "amazon.nova-micro": {
+        "default": {"rpm": 200, "tpm": 200_000},
+        "regions": {
+            "us-east-1": {"rpm": 2000, "tpm": 4_000_000},
+            "eu-west-2": {"rpm": 2000, "tpm": 4_000_000},
+        },
+    },
+    "amazon.nova-lite": {
+        "default": {"rpm": 200, "tpm": 200_000},
+        "regions": {
+            "us-east-1": {"rpm": 2000, "tpm": 4_000_000},
+            "eu-west-2": {"rpm": 2000, "tpm": 4_000_000},
+        },
+    },
+    "amazon.nova-pro": {
+        "default": {"rpm": 250, "tpm": 1_000_000},
+    },
+    "amazon.nova-canvas": {
+        "default": {"rpm": 100, "tpm": 100_000},
+    },
+    # Amazon Titan models
+    "amazon.titan-text-express": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "amazon.titan-text-lite": {
+        "default": {"rpm": 800, "tpm": 300_000},
+    },
+    "amazon.titan-text-premier": {
+        "default": {"rpm": 100, "tpm": 300_000},
+    },
+    "amazon.titan-embed": {
+        "default": {"rpm": 2000, "tpm": 300_000},
+    },
+    # Meta Llama models
+    "meta.llama3-8b-instruct": {
+        "default": {"rpm": 800, "tpm": 300_000},
+    },
+    "meta.llama3-70b-instruct": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "meta.llama3-1-8b-instruct": {
+        "default": {"rpm": 800, "tpm": 300_000},
+    },
+    "meta.llama3-1-70b-instruct": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "meta.llama3-1-405b-instruct": {
+        "default": {"rpm": 200, "tpm": 300_000},
+    },
+    "meta.llama3-2": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "meta.llama3-3-70b-instruct": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "meta.llama2": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    # Mistral models
+    "mistral.mistral-7b-instruct": {
+        "default": {"rpm": 800, "tpm": 300_000},
+    },
+    "mistral.mixtral-8x7b-instruct": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "mistral.mistral-large": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "mistral.mistral-small": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    # Cohere models
+    "cohere.command-r": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "cohere.command-text": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+    "cohere.command-light": {
+        "default": {"rpm": 800, "tpm": 300_000},
+    },
+    "cohere.embed": {
+        "default": {"rpm": 2000, "tpm": 300_000},
+    },
+    # AI21 models
+    "ai21.jamba": {
+        "default": {"rpm": 100, "tpm": 300_000},
+    },
+    "ai21.j2": {
+        "default": {"rpm": 400, "tpm": 300_000},
+    },
+}
+
+
+def _get_static_model_quotas(model_id: str, region: Optional[str] = None) -> Dict[str, int]:
+    """Get static quota defaults for a model.
+
+    Args:
+        model_id: The Bedrock model ID
+        region: AWS region for region-specific overrides
+
+    Returns:
+        Dict with 'rpm' and 'tpm' keys
+    """
+    # Try to find matching quota pattern
+    for pattern, quota_info in _STATIC_MODEL_QUOTAS.items():
+        if model_id.startswith(pattern) or pattern in model_id:
+            default = quota_info.get("default", {"rpm": 100, "tpm": 300_000})
+
+            # Check for region-specific overrides
+            if region and "regions" in quota_info:
+                region_override = quota_info["regions"].get(region)
+                if region_override:
+                    return {**default, **region_override}
+
+            return default
+
+    # Conservative defaults for unknown models
+    return {"rpm": 100, "tpm": 300_000}
+
 
 # Static batch model region mapping
 _STATIC_BATCH_MODEL_REGIONS: Dict[str, List[str]] = {
@@ -628,3 +1093,37 @@ def is_cross_region_profile(model_id: str) -> bool:
         True if it's a cross-region inference profile
     """
     return any(model_id.startswith(prefix) for prefix in CROSS_REGION_PREFIXES.keys())
+
+
+def get_batch_quotas() -> BedrockQuotas:
+    """Get Bedrock batch inference quotas.
+
+    Attempts to retrieve from Service Quotas API with static fallbacks.
+
+    Returns:
+        BedrockQuotas with current quota values
+    """
+    try:
+        manager = get_availability_manager()
+        return manager.get_batch_quotas()
+    except Exception:
+        return BedrockQuotas.get_default()
+
+
+def get_model_quotas(model_id: str, region: Optional[str] = None) -> BedrockModelQuotas:
+    """Get model-specific quotas for online inference.
+
+    Attempts to retrieve RPM/TPM quotas from Service Quotas API with static fallbacks.
+
+    Args:
+        model_id: The Bedrock model ID
+        region: AWS region (uses default if not specified)
+
+    Returns:
+        BedrockModelQuotas with RPM and TPM values
+    """
+    try:
+        manager = get_availability_manager(region=region)
+        return manager.get_model_quotas(model_id)
+    except Exception:
+        return BedrockModelQuotas.get_default(model_id, region)

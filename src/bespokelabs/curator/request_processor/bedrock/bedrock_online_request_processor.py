@@ -15,6 +15,8 @@ import tiktoken
 from bespokelabs.curator.cost import cost_processor_factory
 from bespokelabs.curator.log import logger
 from bespokelabs.curator.request_processor.bedrock.bedrock_availability import (
+    BedrockModelQuotas,
+    get_model_quotas,
     has_limited_converse_support,
     requires_invoke_model,
     supports_converse_api,
@@ -75,6 +77,11 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
 
         self.token_encoding = self.get_token_encoding()
 
+        # Load model-specific quotas dynamically
+        self._model_quotas = self._load_model_quotas()
+        self.default_max_requests_per_minute = self._model_quotas.requests_per_minute
+        self.default_max_tokens_per_minute = self._model_quotas.tokens_per_minute
+
     def _should_use_converse(self) -> bool:
         """Determine whether to use Converse API for this model."""
         model_id = self.config.model
@@ -94,6 +101,22 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         # Default to trying Converse first
         logger.info(f"Model {model_id} - attempting Converse API (will fallback to InvokeModel if needed)")
         return True
+
+    def _load_model_quotas(self) -> BedrockModelQuotas:
+        """Load model-specific quotas for rate limiting.
+
+        Attempts dynamic retrieval from Service Quotas API with static fallbacks.
+
+        Returns:
+            BedrockModelQuotas with RPM and TPM values for this model/region
+        """
+        model_id = self.config.model
+        quotas = get_model_quotas(model_id, self.region)
+        logger.info(
+            f"Loaded quotas for {model_id} in {self.region}: "
+            f"RPM={quotas.requests_per_minute}, TPM={quotas.tokens_per_minute}"
+        )
+        return quotas
 
     @property
     def bedrock_runtime_client(self):

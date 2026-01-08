@@ -17,7 +17,9 @@ from bespokelabs.curator.request_processor.batch.base_batch_request_processor im
 )
 from bespokelabs.curator.request_processor.bedrock.bedrock_availability import (
     BATCH_INFERENCE_REGIONS,
+    BedrockQuotas,
     get_available_batch_regions,
+    get_batch_quotas,
     is_batch_available,
 )
 from bespokelabs.curator.request_processor.config import BatchRequestProcessorConfig
@@ -66,6 +68,9 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         # Initialize clients lazily
         self._bedrock_client = None
         self._s3_client = None
+
+        # Load quotas dynamically with static fallback
+        self._quotas: Optional[BedrockQuotas] = None
 
     def _validate_batch_config(self):
         """Validate batch processing configuration."""
@@ -156,22 +161,35 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         return self._compatible_provider
 
     @property
+    def quotas(self) -> BedrockQuotas:
+        """Get batch quotas with dynamic retrieval and caching."""
+        if self._quotas is None:
+            self._quotas = get_batch_quotas()
+        return self._quotas
+
+    @property
     def max_requests_per_batch(self) -> int:
-        """Maximum requests per batch for Bedrock."""
-        # Bedrock batch inference has a limit of 50,000 records per job
-        return 50_000
+        """Maximum requests per batch for Bedrock.
+
+        Dynamically retrieved from Service Quotas API with static fallback.
+        """
+        return self.quotas.max_records_per_batch_job
 
     @property
     def max_bytes_per_batch(self) -> int:
-        """Maximum bytes per batch for Bedrock."""
-        # Bedrock has a 1GB limit per input file
-        return 1 * 1024 * 1024 * 1024  # 1 GB
+        """Maximum bytes per batch for Bedrock.
+
+        Dynamically retrieved from Service Quotas API with static fallback.
+        """
+        return self.quotas.max_input_file_size_bytes
 
     @property
     def max_concurrent_batch_operations(self) -> int:
-        """Maximum concurrent batch operations."""
-        # Conservative limit for API calls
-        return 5
+        """Maximum concurrent batch operations.
+
+        Dynamically retrieved from Service Quotas API with static fallback.
+        """
+        return self.quotas.max_concurrent_batch_jobs
 
     def create_api_specific_request_batch(self, generic_request: GenericRequest) -> Dict:
         """Convert generic request to Bedrock batch format.
