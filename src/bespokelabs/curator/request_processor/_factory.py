@@ -178,12 +178,12 @@ class _RequestProcessorFactory:
             return MistralBatchRequestProcessor(config)
 
         if backend == "bedrock" and not batch:
-            from bespokelabs.curator.request_processor.bedrock.bedrock_online_request_processor import BedrockOnlineRequestProcessor
+            from bespokelabs.curator.request_processor.online.bedrock_online_request_processor import BedrockOnlineRequestProcessor
 
             return BedrockOnlineRequestProcessor(config)
 
         if backend == "bedrock" and batch:
-            from bespokelabs.curator.request_processor.bedrock.bedrock_batch_request_processor import BedrockBatchRequestProcessor
+            from bespokelabs.curator.request_processor.batch.bedrock_batch_request_processor import BedrockBatchRequestProcessor
 
             return BedrockBatchRequestProcessor(config)
 

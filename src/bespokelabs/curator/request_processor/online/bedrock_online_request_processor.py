@@ -6,6 +6,7 @@ Uses the Converse API as primary with InvokeModel fallback for unsupported model
 import datetime
 import json
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, TypeVar
 
@@ -14,7 +15,7 @@ import tiktoken
 
 from bespokelabs.curator.cost import cost_processor_factory
 from bespokelabs.curator.log import logger
-from bespokelabs.curator.request_processor.bedrock.bedrock_availability import (
+from bespokelabs.curator.request_processor.bedrock_availability import (
     BedrockModelQuotas,
     get_model_quotas,
     has_limited_converse_support,
@@ -43,6 +44,11 @@ _BEDROCK_MULTIMODAL_SUPPORTED_PREFIXES = {
     "meta.llama3-2-90b",
     "meta.llama4",
 }
+
+# Adaptive rate limiting constants
+_MIN_BACKOFF_FACTOR = 0.1  # Minimum 10% of original limits
+_RECOVERY_INCREMENT = 0.1  # Increase backoff factor by 10% per recovery step
+_RECOVERY_REQUEST_INTERVAL = 100  # Recover every N successful requests
 
 
 class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
@@ -81,6 +87,111 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
         self._model_quotas = self._load_model_quotas()
         self.default_max_requests_per_minute = self._model_quotas.requests_per_minute
         self.default_max_tokens_per_minute = self._model_quotas.tokens_per_minute
+
+        # Adaptive rate limiting state
+        self._consecutive_throttles: int = 0
+        self._throttle_backoff_factor: float = 1.0
+        self._original_rpm: int = self._model_quotas.requests_per_minute
+        self._original_tpm: int = self._model_quotas.tokens_per_minute
+        self._successful_requests_since_throttle: int = 0
+        self._rate_limit_lock = threading.Lock()
+
+    def _adjust_rate_limits_for_throttling(self, status_tracker: OnlineStatusTracker) -> None:
+        """Adjust rate limits in response to throttling errors.
+
+        Implements exponential backoff by reducing rate limits based on
+        consecutive throttling errors. The backoff factor is calculated as
+        0.5^(consecutive_throttles), with a minimum of 10% of original limits.
+
+        Args:
+            status_tracker: The status tracker to update with new limits
+        """
+        with self._rate_limit_lock:
+            self._consecutive_throttles += 1
+            self._successful_requests_since_throttle = 0
+
+            # Calculate new backoff factor: 0.5^consecutive_throttles
+            new_backoff = 0.5 ** self._consecutive_throttles
+
+            # Cap at minimum of 10% of original limits
+            self._throttle_backoff_factor = max(new_backoff, _MIN_BACKOFF_FACTOR)
+
+            # Calculate new limits
+            new_rpm = int(self._original_rpm * self._throttle_backoff_factor)
+            new_tpm = int(self._original_tpm * self._throttle_backoff_factor)
+
+            # Ensure at least 1 request per minute
+            new_rpm = max(new_rpm, 1)
+            new_tpm = max(new_tpm, 1000)
+
+            # Update the status tracker's rate limits
+            status_tracker.max_requests_per_minute = new_rpm
+            status_tracker.max_tokens_per_minute = new_tpm
+
+            # Also update default limits for consistency
+            self.default_max_requests_per_minute = new_rpm
+            self.default_max_tokens_per_minute = new_tpm
+
+            logger.warning(
+                f"Throttling detected ({self._consecutive_throttles} consecutive). "
+                f"Reducing rate limits: RPM {self._original_rpm} -> {new_rpm} "
+                f"({self._throttle_backoff_factor:.0%}), "
+                f"TPM {self._original_tpm} -> {new_tpm} ({self._throttle_backoff_factor:.0%})"
+            )
+
+    def _recover_from_throttling(self, status_tracker: OnlineStatusTracker) -> None:
+        """Gradually recover rate limits after successful requests.
+
+        When currently throttled (backoff factor < 1.0), this method tracks
+        successful requests and gradually increases the rate limits back
+        toward the original values.
+
+        Args:
+            status_tracker: The status tracker to update with recovered limits
+        """
+        with self._rate_limit_lock:
+            # Only recover if currently throttled
+            if self._throttle_backoff_factor >= 1.0:
+                return
+
+            self._successful_requests_since_throttle += 1
+
+            # Check if we should recover
+            if self._successful_requests_since_throttle < _RECOVERY_REQUEST_INTERVAL:
+                return
+
+            # Reset counter for next recovery interval
+            self._successful_requests_since_throttle = 0
+
+            # Increase backoff factor
+            old_factor = self._throttle_backoff_factor
+            self._throttle_backoff_factor = min(
+                self._throttle_backoff_factor + _RECOVERY_INCREMENT, 1.0
+            )
+
+            # Calculate new limits
+            new_rpm = int(self._original_rpm * self._throttle_backoff_factor)
+            new_tpm = int(self._original_tpm * self._throttle_backoff_factor)
+
+            # Update the status tracker's rate limits
+            status_tracker.max_requests_per_minute = new_rpm
+            status_tracker.max_tokens_per_minute = new_tpm
+
+            # Also update default limits for consistency
+            self.default_max_requests_per_minute = new_rpm
+            self.default_max_tokens_per_minute = new_tpm
+
+            # Check if fully recovered
+            if self._throttle_backoff_factor >= 1.0:
+                self._consecutive_throttles = 0
+                logger.info(
+                    f"Rate limits fully recovered: RPM={new_rpm}, TPM={new_tpm}"
+                )
+            else:
+                logger.info(
+                    f"Recovering rate limits: {old_factor:.0%} -> {self._throttle_backoff_factor:.0%}. "
+                    f"RPM={new_rpm}, TPM={new_tpm}"
+                )
 
     def _should_use_converse(self) -> bool:
         """Determine whether to use Converse API for this model."""
@@ -543,6 +654,9 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             else:
                 response = await self._call_invoke_model(request, status_tracker)
 
+            # Successful request - attempt recovery if throttled
+            self._recover_from_throttling(status_tracker)
+
             return response
 
         except Exception as e:
@@ -551,6 +665,9 @@ class BedrockOnlineRequestProcessor(BaseOnlineRequestProcessor):
             if "rate" in error_str or "throttl" in error_str:
                 status_tracker.time_of_last_rate_limit_error = time.time()
                 status_tracker.num_rate_limit_errors += 1
+
+                # Apply adaptive rate limiting
+                self._adjust_rate_limits_for_throttling(status_tracker)
 
             raise
 

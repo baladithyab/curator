@@ -15,7 +15,7 @@ from bespokelabs.curator.log import logger
 from bespokelabs.curator.request_processor.batch.base_batch_request_processor import (
     BaseBatchRequestProcessor,
 )
-from bespokelabs.curator.request_processor.bedrock.bedrock_availability import (
+from bespokelabs.curator.request_processor.bedrock_availability import (
     BATCH_INFERENCE_REGIONS,
     BedrockQuotas,
     get_available_batch_regions,

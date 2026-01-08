@@ -158,6 +158,7 @@ class BedrockAvailabilityManager:
         self._quotas_cache: Optional[BedrockQuotas] = None
         self._model_quotas_cache: Dict[str, BedrockModelQuotas] = {}
         self._quota_name_to_model_cache: Optional[Dict[str, str]] = None
+        self._quota_code_cache: Dict[str, Dict[str, str]] = {}  # Cache for quota codes: {model_id: {'rpm_code': 'L-XXX', 'tpm_code': 'L-YYY'}}
 
     @property
     def bedrock_client(self):
@@ -452,6 +453,7 @@ class BedrockAvailabilityManager:
         """Get model-specific quotas for online inference.
 
         Attempts to retrieve RPM/TPM quotas from Service Quotas API with static fallbacks.
+        Prioritizes Cross-Region Inference (CRI) quotas over on-demand quotas when available.
 
         Args:
             model_id: The Bedrock model ID
@@ -471,19 +473,70 @@ class BedrockAvailabilityManager:
             # Get model-friendly name for quota matching
             model_name = self._get_model_friendly_name(model_id)
             if not model_name:
+                logger.warning(
+                    f"Could not find friendly name mapping for model '{model_id}'. "
+                    "Quota lookup will use static defaults. Consider adding a mapping."
+                )
                 self._model_quotas_cache[cache_key] = quotas
                 return quotas
+
+            # Check if we have cached quota codes for this model
+            if model_id in self._quota_code_cache and not refresh:
+                cached_codes = self._quota_code_cache[model_id]
+                try:
+                    # Use get_service_quota for faster lookup with cached codes
+                    if 'rpm_code' in cached_codes:
+                        rpm_response = self.service_quotas_client.get_service_quota(
+                            ServiceCode="bedrock",
+                            QuotaCode=cached_codes['rpm_code'],
+                        )
+                        rpm_value = rpm_response.get("Quota", {}).get("Value")
+                        if rpm_value is not None:
+                            quotas.requests_per_minute = int(rpm_value)
+
+                    if 'tpm_code' in cached_codes:
+                        tpm_response = self.service_quotas_client.get_service_quota(
+                            ServiceCode="bedrock",
+                            QuotaCode=cached_codes['tpm_code'],
+                        )
+                        tpm_value = tpm_response.get("Quota", {}).get("Value")
+                        if tpm_value is not None:
+                            quotas.tokens_per_minute = int(tpm_value)
+
+                    logger.debug(
+                        f"Loaded quotas for {model_id} from cached codes: "
+                        f"RPM={quotas.requests_per_minute}, TPM={quotas.tokens_per_minute}"
+                    )
+                    self._model_quotas_cache[cache_key] = quotas
+                    return quotas
+                except Exception as e:
+                    logger.debug(f"Failed to use cached quota codes for {model_id}: {e}. Falling back to full listing.")
+                    # Remove invalid cached codes
+                    del self._quota_code_cache[model_id]
 
             # Search through quotas for matching model
             paginator = self.service_quotas_client.get_paginator("list_service_quotas")
 
             rpm_found = False
             tpm_found = False
+            rpm_code = None
+            tpm_code = None
+
+            # Track both CRI and on-demand quotas
+            cri_rpm = None
+            cri_tpm = None
+            cri_rpm_code = None
+            cri_tpm_code = None
+            ondemand_rpm = None
+            ondemand_tpm = None
+            ondemand_rpm_code = None
+            ondemand_tpm_code = None
 
             for page in paginator.paginate(ServiceCode="bedrock"):
                 for quota in page.get("Quotas", []):
                     quota_name = quota.get("QuotaName", "")
                     quota_value = quota.get("Value")
+                    quota_code = quota.get("QuotaCode", "")
 
                     if quota_value is None:
                         continue
@@ -494,24 +547,74 @@ class BedrockAvailabilityManager:
                     # Quota names look like:
                     # "On-demand model inference requests per minute for Anthropic Claude 3 Haiku"
                     # "On-demand model inference tokens per minute for Anthropic Claude 3 Haiku"
+                    # "Cross-region model inference requests per minute for Anthropic Claude 3 Haiku"
+                    # "Cross-region model inference tokens per minute for Anthropic Claude 3 Haiku"
                     if model_name.lower() in quota_name_lower:
-                        if "requests per minute" in quota_name_lower and "on-demand" in quota_name_lower:
-                            quotas.requests_per_minute = int(quota_value)
-                            rpm_found = True
-                        elif "tokens per minute" in quota_name_lower and "on-demand" in quota_name_lower:
-                            quotas.tokens_per_minute = int(quota_value)
-                            tpm_found = True
+                        is_cri = "cross-region" in quota_name_lower
+                        is_ondemand = "on-demand" in quota_name_lower
 
-                    if rpm_found and tpm_found:
+                        if "requests per minute" in quota_name_lower:
+                            if is_cri:
+                                cri_rpm = int(quota_value)
+                                cri_rpm_code = quota_code
+                            elif is_ondemand:
+                                ondemand_rpm = int(quota_value)
+                                ondemand_rpm_code = quota_code
+                        elif "tokens per minute" in quota_name_lower:
+                            if is_cri:
+                                cri_tpm = int(quota_value)
+                                cri_tpm_code = quota_code
+                            elif is_ondemand:
+                                ondemand_tpm = int(quota_value)
+                                ondemand_tpm_code = quota_code
+
+                    # Check if we've found both CRI quotas (preferred) or both on-demand quotas
+                    if cri_rpm is not None and cri_tpm is not None:
+                        rpm_found = True
+                        tpm_found = True
                         break
 
-                if rpm_found and tpm_found:
+                if cri_rpm is not None and cri_tpm is not None:
                     break
+
+            # Prioritize CRI quotas over on-demand quotas (CRI typically has higher limits)
+            if cri_rpm is not None:
+                quotas.requests_per_minute = cri_rpm
+                rpm_code = cri_rpm_code
+                rpm_found = True
+                logger.debug(f"Using cross-region RPM quota for {model_id}: {cri_rpm}")
+            elif ondemand_rpm is not None:
+                quotas.requests_per_minute = ondemand_rpm
+                rpm_code = ondemand_rpm_code
+                rpm_found = True
+
+            if cri_tpm is not None:
+                quotas.tokens_per_minute = cri_tpm
+                tpm_code = cri_tpm_code
+                tpm_found = True
+                logger.debug(f"Using cross-region TPM quota for {model_id}: {cri_tpm}")
+            elif ondemand_tpm is not None:
+                quotas.tokens_per_minute = ondemand_tpm
+                tpm_code = ondemand_tpm_code
+                tpm_found = True
+
+            # Cache the quota codes for faster future lookups
+            if rpm_code or tpm_code:
+                self._quota_code_cache[model_id] = {}
+                if rpm_code:
+                    self._quota_code_cache[model_id]['rpm_code'] = rpm_code
+                if tpm_code:
+                    self._quota_code_cache[model_id]['tpm_code'] = tpm_code
 
             if rpm_found or tpm_found:
                 logger.debug(
                     f"Loaded quotas for {model_id} from Service Quotas API: "
                     f"RPM={quotas.requests_per_minute}, TPM={quotas.tokens_per_minute}"
+                )
+            else:
+                logger.warning(
+                    f"Model '{model_id}' (friendly name: '{model_name}') did not match any quota in Service Quotas API. "
+                    "Using static defaults. This may indicate a missing quota mapping or a new model."
                 )
 
         except Exception as e:
@@ -599,6 +702,20 @@ class BedrockAvailabilityManager:
         for pattern, friendly_name in model_name_mappings.items():
             if pattern in model_id:
                 return friendly_name
+
+        # Dynamic fallback: try to get model name from Bedrock API
+        model_info = self.get_model_info(model_id)
+        if model_info and model_info.model_name:
+            # The model_name from API is often already in a format suitable for quota matching
+            # e.g., "Claude 3 Haiku" from Anthropic
+            logger.debug(f"Using dynamic model name for {model_id}: {model_info.model_name}")
+            # Construct a friendly name by combining provider and model name
+            if model_info.provider and model_info.model_name:
+                # Avoid duplication if provider is already in model_name
+                if model_info.provider.lower() not in model_info.model_name.lower():
+                    return f"{model_info.provider} {model_info.model_name}"
+                return model_info.model_name
+            return model_info.model_name
 
         return None
 
