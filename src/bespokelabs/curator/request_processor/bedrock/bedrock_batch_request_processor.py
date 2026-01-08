@@ -7,9 +7,8 @@ import asyncio
 import datetime
 import json
 import os
-import tempfile
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from bespokelabs.curator.cost import cost_processor_factory
 from bespokelabs.curator.log import logger
@@ -111,10 +110,10 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         if self._bedrock_client is None:
             try:
                 import boto3
-            except ImportError:
+            except ImportError as e:
                 raise ImportError(
                     "boto3 is required for Bedrock support. Install with: pip install boto3"
-                )
+                ) from e
 
             session_kwargs = {}
             if self.profile:
@@ -133,10 +132,10 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
         if self._s3_client is None:
             try:
                 import boto3
-            except ImportError:
+            except ImportError as e:
                 raise ImportError(
                     "boto3 is required for Bedrock support. Install with: pip install boto3"
-                )
+                ) from e
 
             session_kwargs = {}
             if self.profile:
@@ -443,7 +442,6 @@ class BedrockBatchRequestProcessor(BaseBatchRequestProcessor):
             generic_status = status_mapping.get(bedrock_status, GenericBatchStatus.SUBMITTED.value)
 
             # Get request counts if available
-            input_count = response.get("inputDataConfig", {}).get("s3InputDataConfig", {}).get("recordCount", batch.request_counts.total)
             output_count = response.get("outputDataConfig", {}).get("s3OutputDataConfig", {}).get("recordCount", 0)
 
             # For completed jobs, succeeded = output_count
